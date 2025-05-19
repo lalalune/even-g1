@@ -1,0 +1,3278 @@
+Project Path: even-g1
+
+Source Tree:
+
+```
+even-g1
+├── even_glasses
+│   ├── command_logger.py
+│   ├── service_identifiers.py
+│   ├── models.py
+│   ├── __init__.py
+│   ├── notification_handlers.py
+│   ├── README.md
+│   ├── rsvp_story.txt
+│   ├── bluetooth_manager.py
+│   ├── utils.py
+│   └── commands.py
+├── README.md
+├── setup.py
+├── examples.py
+└── main.py
+
+```
+
+`/Users/shawwalters/even-g1/even_glasses/command_logger.py`:
+
+```py
+import json
+import logging
+from collections import deque
+from datetime import datetime
+from uuid import UUID
+from pathlib import Path
+from typing import Dict, Union, List
+import binascii
+from even_glasses.models import (
+    Command,
+    SubCommand,
+    MicStatus,
+    ScreenAction,
+    AIStatus,
+)
+
+
+DEBUG = False
+
+
+class CommandLogger:
+    MAX_TIMESTAMPS = 5  # Keep only last 5 timestamps
+
+    COMMAND_TYPES = {
+        Command.START_AI: "Start Even AI",
+        Command.OPEN_MIC: "Mic Control",
+        Command.MIC_RESPONSE: "Mic Response",
+        Command.RECEIVE_MIC_DATA: "Mic Data",
+        Command.INIT: "Initialize",
+        Command.HEARTBEAT: "Heartbeat",
+        Command.SEND_RESULT: "AI Result",
+        Command.QUICK_NOTE: "Quick Note",
+        Command.DASHBOARD: "Dashboard",
+        Command.NOTIFICATION: "Notification",
+    }
+
+    def __init__(self):
+        self.data_dir = Path("./notification_logs")
+        self.data_dir.mkdir(exist_ok=True)
+        self.log_file = self.data_dir / "notification_logs.json"
+        self.command_history: Dict[str, List[Dict]] = {}
+        self._load_existing_logs()
+        self.command_history: Dict[str, Dict[str, Dict]] = {}
+
+    def _parse_command(self, data: bytes) -> Dict:
+        if not data:
+            return self._create_error_parse("Empty data received")
+
+        try:
+            cmd = data[0]
+            parsed = {
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "command": {
+                    "hex": f"0x{cmd:02X}",
+                    "int": cmd,
+                    "type": self.COMMAND_TYPES.get(
+                        cmd, f"Unknown command: 0x{cmd:02X}"
+                    ),
+                },
+                "raw": {
+                    "hex": data.hex(),
+                    "hex_dump": binascii.hexlify(data).decode("ascii"),
+                    "pretty_hex": " ".join(f"{b:02x}" for b in data),
+                    "bytes": str(data),
+                    "int_array": list(data),
+                    "crc32": f"0x{binascii.crc32(data):08x}",  # Add CRC32 checksum
+                },
+            }
+            # Parse specific commands
+            if cmd == Command.START_AI:
+                subcmd = data[1] if len(data) > 1 else None
+                parsed["subcmd"] = {
+                    "hex": f"0x{subcmd:02X}" if subcmd is not None else None,
+                    "int": subcmd,
+                    "description": {
+                        SubCommand.EXIT: "Exit to dashboard",
+                        SubCommand.PAGE_CONTROL: "Page up/down control",
+                        SubCommand.START: "Start Even AI",
+                        SubCommand.STOP: "Stop Even AI recording",
+                    }.get(
+                        subcmd,
+                        f"Unknown subcmd: 0x{subcmd:02X}"
+                        if subcmd is not None
+                        else "No subcmd",
+                    ),
+                }
+
+            elif cmd == Command.OPEN_MIC:
+                enable = data[1] if len(data) > 1 else None
+                parsed["mic_control"] = {
+                    "hex": f"0x{enable:02X}" if enable is not None else None,
+                    "int": enable,
+                    "status": "Enable MIC"
+                    if enable == MicStatus.ENABLE
+                    else "Disable MIC",
+                }
+
+            elif cmd == Command.SEND_RESULT:
+                if len(data) >= 9:
+                    parsed["ai_result"] = {
+                        "sequence": data[1],
+                        "total_packages": data[2],
+                        "current_package": data[3],
+                        "screen_status": {
+                            "action": data[4] & 0x0F,  # Lower 4 bits
+                            "ai_status": data[4] & 0xF0,  # Upper 4 bits
+                            "description": self._get_screen_status_description(data[4]),
+                        },
+                        "page_info": {"current": data[7], "total": data[8]},
+                    }
+
+            elif cmd == Command.NOTIFICATION:
+                if len(data) >= 4:
+                    parsed["notification"] = {
+                        "notify_id": data[1],
+                        "total_chunks": data[2],
+                        "current_chunk": data[3],
+                    }
+
+            return parsed
+
+        except Exception as e:
+            return self._create_error_parse(f"Error parsing command: {str(e)}")
+
+    def _get_screen_status_description(self, status: int) -> str:
+        """Get human readable description of screen status"""
+        action = status & 0x0F
+        ai_status = status & 0xF0
+
+        action_desc = (
+            "New content" if action == ScreenAction.NEW_CONTENT else "Unknown action"
+        )
+        ai_desc = {
+            AIStatus.DISPLAYING: "Displaying (auto)",
+            AIStatus.DISPLAY_COMPLETE: "Complete",
+            AIStatus.MANUAL_MODE: "Manual mode",
+            AIStatus.NETWORK_ERROR: "Network error",
+        }.get(ai_status, "Unknown AI status")
+
+        return f"{action_desc} - {ai_desc}"
+
+    def _create_error_parse(self, error_msg: str) -> Dict:
+        """Create error parsing result"""
+        return {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "error": error_msg,
+            "command": {"type": "Error"},
+        }
+
+    def log_command(
+        self, side: str, sender: Union[UUID, int, str], data: Union[bytes, bytearray]
+    ) -> Dict:
+        sender_key = f"{sender} {side}"
+        if isinstance(data, bytearray):
+            data = bytes(data)
+
+        parsed_cmd = self._parse_command(data)
+        current_time = parsed_cmd["timestamp"]
+
+        cmd_identifier = json.dumps(
+            {k: v for k, v in parsed_cmd.items() if k != "timestamp"},
+            sort_keys=True,
+        )
+
+        if sender_key not in self.command_history:
+            self.command_history[sender_key] = {}
+
+        if cmd_identifier not in self.command_history[sender_key]:
+            # New command - initialize with deque
+            self.command_history[sender_key][cmd_identifier] = {
+                "command": parsed_cmd,
+                "timestamps": deque([current_time], maxlen=self.MAX_TIMESTAMPS),
+            }
+        else:
+            # Existing command - append timestamp to deque
+            self.command_history[sender_key][cmd_identifier]["timestamps"].append(
+                current_time
+            )
+
+        self._save_logs()
+        return self.command_history[sender_key][cmd_identifier]
+
+    def _save_logs(self):
+        try:
+            serializable_history = {}
+            for sender, commands in self.command_history.items():
+                serializable_history[sender] = []
+                for cmd_data in commands.values():
+                    entry = cmd_data["command"].copy()
+                    # Convert deque to list for serialization
+                    entry["timestamps"] = list(cmd_data["timestamps"])
+                    serializable_history[sender].append(entry)
+
+            with open(self.log_file, "w") as f:
+                json.dump(serializable_history, f, indent=2)
+        except Exception as e:
+            logging.debug(f"Error saving command logs: {e}")
+
+    def _load_existing_logs(self):
+        if self.log_file.exists():
+            try:
+                with open(self.log_file, "r") as f:
+                    loaded_data = json.load(f)
+                    self.command_history = {}
+
+                    for sender, commands in loaded_data.items():
+                        self.command_history[sender] = {}
+                        for entry in commands:
+                            timestamps = entry.pop("timestamps", [])
+                            cmd_identifier = json.dumps(entry, sort_keys=True)
+                            # Convert timestamps list to deque
+                            self.command_history[sender][cmd_identifier] = {
+                                "command": entry,
+                                "timestamps": deque(
+                                    timestamps[-self.MAX_TIMESTAMPS :],
+                                    maxlen=self.MAX_TIMESTAMPS,
+                                ),
+                            }
+            except json.JSONDecodeError:
+                self.command_history = {}
+
+
+command_logger = CommandLogger()
+
+
+def debug_command_logs(side: str,
+                       sender: Union[UUID, int, str],
+                       data: bytes | bytearray):
+    # Log the command first
+    cmd_log = command_logger.log_command(side, sender, data)
+
+    # Create serializable version of cmd_log
+    serializable_log = {
+        "side": side,
+        "command": cmd_log["command"],
+        "timestamps": list(cmd_log["timestamps"]),  # Convert deque to list
+    }
+
+    logging.debug(f"Command received: {json.dumps(serializable_log, indent=2)}")
+
+    # Rest of your existing notification handling code...
+    if isinstance(data, bytearray):
+        data = bytes(data)
+
+```
+
+`/Users/shawwalters/even-g1/even_glasses/service_identifiers.py`:
+
+```py
+# Service and Characteristic UUIDs
+UART_SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+UART_TX_CHAR_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"  # Write
+UART_RX_CHAR_UUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"  # Read/Notify
+
+```
+
+`/Users/shawwalters/even-g1/even_glasses/models.py`:
+
+```py
+from pydantic import BaseModel, Field, field_validator
+from typing import Literal, List
+import time
+import json
+from enum import IntEnum
+from datetime import datetime
+
+class DesiredConnectionState(IntEnum):
+    DISCONNECTED = 0x00
+    CONNECTED = 0x01
+
+class Command(IntEnum):
+    START_AI = 0xF5
+    OPEN_MIC = 0x0E
+    MIC_RESPONSE = 0x0E
+    RECEIVE_MIC_DATA = 0xF1
+    INIT = 0x4D
+    HEARTBEAT = 0x25
+    SEND_RESULT = 0x4E
+    QUICK_NOTE = 0x21
+    DASHBOARD = 0x22
+    NOTIFICATION = 0x4B
+    SILENT_MODE = 0x03
+    BRIGHTNESS = 0x01
+    DASHBOARD_POSITION = 0x26
+    HEADUP_ANGLE = 0x0B
+    DASHBOARD_SHOW = 0x06
+    GLASSES_WEAR = 0x27
+    
+class GlassesWearStatus(IntEnum):
+    ON = 0x01
+    OFF = 0x00
+
+class SubCommand(IntEnum):
+    EXIT = 0x00
+    PAGE_CONTROL = 0x01
+    START = 0x17
+    STOP = 0x18
+    PUT_ON = 0x06
+    TAKEN_OFF = 0x07
+
+class MicStatus(IntEnum):
+    ENABLE = 0x01
+    DISABLE = 0x00
+
+class ResponseStatus(IntEnum):
+    SUCCESS = 0xC9
+    FAILURE = 0xCA
+
+class ScreenAction(IntEnum):
+    NEW_CONTENT = 0x01
+
+class AIStatus(IntEnum):
+    DISPLAYING = 0x30  # Even AI displaying (automatic mode default)
+    DISPLAY_COMPLETE = 0x40  # Even AI display complete (last page of automatic mode)
+    MANUAL_MODE = 0x50  # Even AI manual mode
+    NETWORK_ERROR = 0x60  # Even AI network error
+
+class SilentModeStatus(IntEnum):
+    OFF = 0x0A
+    ON = 0x0C
+
+class BrightnessAuto(IntEnum):
+    OFF = 0x00
+    ON = 0x01
+
+class DashboardPosition(IntEnum):
+    POSITION_0 = 0x00  # Bottom
+    POSITION_1 = 0x01
+    POSITION_2 = 0x02
+    POSITION_3 = 0x03
+    POSITION_4 = 0x04
+    POSITION_5 = 0x05
+    POSITION_6 = 0x06
+    POSITION_7 = 0x07
+    POSITION_8 = 0x08  # Top
+
+class DashboardState(IntEnum):
+    OFF = 0x00
+    ON = 0x01
+
+class SendResult(BaseModel):
+    command: int = Field(default=Command.SEND_RESULT)
+    seq: int = Field(default=0)
+    total_packages: int = Field(default=0)
+    current_package: int = Field(default=0)
+    screen_status: int = Field(default=ScreenAction.NEW_CONTENT | AIStatus.DISPLAYING)
+    new_char_pos0: int = Field(default=0)
+    new_char_pos1: int = Field(default=0)
+    page_number: int = Field(default=1)
+    max_pages: int = Field(default=1)
+    data: bytes = Field(default=b"")
+
+    def build(self) -> bytes:
+        header = bytes(
+            [
+                self.command,
+                self.seq,
+                self.total_packages,
+                self.current_package,
+                self.screen_status,
+                self.new_char_pos0,
+                self.new_char_pos1,
+                self.page_number,
+                self.max_pages,
+            ]
+        )
+        return header + self.data
+
+class NCSNotification(BaseModel):
+    msg_id: int = Field(..., alias="msg_id", description="Message ID")
+    type: int = Field(1, alias="type", description="Notification type")
+    app_identifier: str = Field(
+        ..., alias="app_identifier", description="App identifier"
+    )
+    title: str = Field(..., alias="title", description="Notification title")
+    subtitle: str = Field(..., alias="subtitle", description="Notification subtitle")
+    message: str = Field(..., alias="message", description="Notification message")
+    time_s: int = Field(
+        default_factory=lambda: int(time.time()),
+        alias="time_s",
+        description="Current time in seconds since the epoch",
+    )
+    date: str = Field(
+        default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        alias="date",
+        description="Current date and time",
+    )
+    display_name: str = Field(..., alias="display_name", description="Display name")
+
+    class ConfigDict:
+        populate_by_name = True
+
+class Notification(BaseModel):
+    ncs_notification: NCSNotification = Field(
+        ..., alias="ncs_notification", description="NCS Notification details"
+    )
+    type: Literal["Add"] = Field(
+        "Add", alias="type", description="Type of notification"
+    )
+
+    class ConfigDict:
+        populate_by_name = True
+
+    def to_json(self):
+        return self.model_dump(by_alias=True)
+
+    def to_bytes(self):
+        return json.dumps(self.to_json()).encode("utf-8")
+
+    async def construct_notification(self):
+        json_bytes = self.to_bytes()
+        max_chunk_size = 180 - 4  # Subtract 4 bytes for header
+        chunks = [
+            json_bytes[i : i + max_chunk_size]
+            for i in range(0, len(json_bytes), max_chunk_size)
+        ]
+        total_chunks = len(chunks)
+        encoded_chunks = []
+        for index, chunk in enumerate(chunks):
+            notify_id = 0  # Set appropriate notification ID
+            header = bytes([Command.NOTIFICATION, notify_id, total_chunks, index])
+            encoded_chunk = header + chunk
+            encoded_chunks.append(encoded_chunk)
+        return encoded_chunks
+
+class RSVPConfig(BaseModel):
+    words_per_group: int = Field(default=1)
+    wpm: int = Field(default=250)
+    padding_char: str = Field(default="...")
+
+class BleReceive(BaseModel):
+    lr: str = Field(default="L", description="Left or Right")
+    cmd: int = Field(default=0x00)
+    data: bytes = Field(default_factory=bytes)
+    is_timeout: bool = Field(default=False)
+
+class NoteConstants(IntEnum):
+    COMMAND = 0x1E
+    FIXED_BYTE = 0x00
+    FIXED_BYTE_2 = 0x01
+
+class NoteAdd(BaseModel):
+    command: int = Field(default=NoteConstants.COMMAND)
+    note_number: int = Field(..., description="Note number (1-4)")
+    name: str = Field(..., description="Note name")
+    text: str = Field(..., description="Note text")
+
+    @field_validator('note_number')
+    def validate_note_number(cls, v):
+        if not 1 <= v <= 4:
+            raise ValueError('Note number must be between 1 and 4')
+        return v
+
+    def _get_fixed_bytes(self) -> bytes:
+        """Return the fixed bytes sequence"""
+        return bytes([0x03, 0x01, 0x00, 0x01, 0x00])
+
+    def _get_versioning_byte(self) -> int:
+        """Generate versioning byte based on timestamp"""
+        return int(time.time()) % 256
+
+    def _calculate_payload_length(self, name_bytes: bytes, text_bytes: bytes) -> int:
+        """Calculate total payload length"""
+        components: List[int] = [
+            1,  # Fixed byte
+            1,  # Versioning byte
+            len(self._get_fixed_bytes()),  # Fixed bytes sequence
+            1,  # Note number
+            1,  # Fixed byte 2
+            1,  # Title length
+            len(name_bytes),  # Title bytes
+            1,  # Text length
+            1,  # Fixed byte after text length
+            len(text_bytes),  # Text bytes
+            2,  # Final bytes
+        ]
+        return sum(components)
+
+    def build(self) -> bytes:
+        """Build the command bytes sequence"""
+        # Encode strings
+        name_bytes = self.name.encode('utf-8')
+        text_bytes = self.text.encode('utf-8')
+
+        # Get components
+        payload_length = self._calculate_payload_length(name_bytes, text_bytes)
+        versioning_byte = self._get_versioning_byte()
+        fixed_bytes = self._get_fixed_bytes()
+
+        # Assemble command
+        command = (
+            bytes([
+                self.command,
+                payload_length & 0xFF,
+                NoteConstants.FIXED_BYTE,
+                versioning_byte,
+            ]) 
+            + fixed_bytes 
+            + bytes([
+                self.note_number,
+                NoteConstants.FIXED_BYTE_2,
+                len(name_bytes) & 0xFF,
+            ]) 
+            + name_bytes 
+            + bytes([
+                len(text_bytes) & 0xFF,
+                NoteConstants.FIXED_BYTE,
+            ]) 
+            + text_bytes
+        )
+
+        return command
+
+```
+
+`/Users/shawwalters/even-g1/even_glasses/__init__.py`:
+
+```py
+from even_glasses.bluetooth_manager import (
+    Glass,
+    GlassesManager
+)
+
+from even_glasses.models import (
+    ScreenAction,
+    Notification,
+    RSVPConfig,
+    Command,  
+)
+
+__version__ = "0.1.11"
+
+__all__ = [
+    "Glass",
+    "GlassesManager",
+    "Command",
+    "ScreenAction",
+    "Notification",
+    "RSVPConfig",
+]
+```
+
+`/Users/shawwalters/even-g1/even_glasses/notification_handlers.py`:
+
+```py
+import logging
+from typing import Dict, Union
+from uuid import UUID
+from even_glasses.models import (
+    Command,
+    SubCommand,
+    MicStatus,
+    ResponseStatus,
+)
+from even_glasses.bluetooth_manager import Glass
+from even_glasses.command_logger import debug_command_logs, DEBUG
+from typing import Callable, Awaitable
+
+
+async def handle_heartbeat(
+    glass: Glass, sender: Union[UUID, int, str], data: bytes
+) -> None:
+    """
+    Handle the HEARTBEAT command from the device.
+
+    Command: HEARTBEAT (0x25)
+    """
+    logging.info(f"Heartbeat received from {glass.side}")
+    # Additional processing can be implemented here
+
+
+async def handle_start_ai(
+    glass: Glass, sender: Union[UUID, int, str], data: bytes
+) -> None:
+    """
+    Handle the START_AI command including subcommands.
+
+    Command: START_AI (0xF5)
+    Subcommands:
+      - 0x00: Exit to dashboard manually. double tap on the touchpad
+      - 0x01: Page up/down control in manual mode
+      - 0x17: Start Even AI
+      - 0x18: Stop Even AI recording
+    """
+    if len(data) < 2:
+        logging.warning(f"Invalid data length for START_AI command from {glass.side}")
+        return
+
+    sub_command_byte = data[1]
+    try:
+        sub_command = SubCommand(sub_command_byte)
+    except ValueError:
+        logging.warning(
+            f"Unknown subcommand: 0x{sub_command_byte:02X} received from {glass.side}"
+        )
+        return
+
+    logging.info(
+        f"START_AI command with subcommand {sub_command.name} received from {glass.side}"
+    )
+
+    # Handle subcommands
+    if sub_command == SubCommand.EXIT:
+        # Handle exit to dashboard
+        logging.info(f"Handling EXIT to dashboard command from {glass.side}")
+        # Implement your logic here
+    elif sub_command == SubCommand.PAGE_CONTROL:
+        # Handle page up/down control
+        logging.info(f"Handling PAGE_CONTROL command from {glass.side}")
+        # Implement your logic here
+    elif sub_command == SubCommand.START:
+        # Handle starting Even AI
+        logging.info(f"Handling START Even AI command from {glass.side}")
+        # Implement your logic here
+    elif sub_command == SubCommand.STOP:
+        # Handle stopping Even AI recording
+        logging.info(f"Handling STOP Even AI recording command from {glass.side}")
+        # Implement your logic here
+    elif sub_command == SubCommand.PUT_ON:
+        # Handle glasses put on
+        logging.info(f"Handling PUT_ON command from {glass.side}")
+        # Implement your logic here
+    elif sub_command == SubCommand.TAKEN_OFF:
+        # Handle glasses taken off
+        logging.info(f"Handling TAKEN_OFF command from {glass.side}")
+        # Implement your logic here
+
+    else:
+        logging.warning(
+            f"Unhandled subcommand: {sub_command} received from {glass.side}"
+        )
+
+
+async def handle_open_mic(
+    glass: Glass, sender: Union[UUID, int, str], data: bytes
+) -> None:
+    """
+    Handle the OPEN_MIC command.
+
+    Command: OPEN_MIC (0x0E)
+    """
+    if len(data) < 2:
+        logging.warning(f"Invalid data length for OPEN_MIC command from {glass.side}")
+        return
+
+    mic_status_byte = data[1]
+    try:
+        mic_status = MicStatus(mic_status_byte)
+    except ValueError:
+        logging.warning(
+            f"Unknown mic status: 0x{mic_status_byte:02X} received from {glass.side}"
+        )
+        return
+
+    logging.info(
+        f"OPEN_MIC command received from {glass.side} with status {mic_status.name}"
+    )
+    # Implement your logic here
+
+
+async def handle_mic_response(
+    glass: Glass, sender: Union[UUID, int, str], data: bytes
+) -> None:
+    """
+    Handle the MIC_RESPONSE command.
+
+    Command: MIC_RESPONSE (0x0E)
+    """
+    if len(data) < 3:
+        logging.warning(
+            f"Invalid data length for MIC_RESPONSE command from {glass.side}"
+        )
+        return
+
+    rsp_status_byte = data[1]
+    enable_byte = data[2]
+
+    try:
+        rsp_status = ResponseStatus(rsp_status_byte)
+        mic_status = MicStatus(enable_byte)
+    except ValueError as e:
+        logging.warning(f"Error parsing MIC_RESPONSE from {glass.side}: {e}")
+        return
+
+    logging.info(
+        f"MIC_RESPONSE received from {glass.side}: rsp_status={rsp_status.name}, mic_status={mic_status.name}"
+    )
+    # Implement your logic here
+
+
+async def handle_receive_mic_data(
+    glass: Glass, sender: Union[UUID, int, str], data: bytes
+) -> None:
+    """
+    Handle the RECEIVE_MIC_DATA command.
+
+    Command: RECEIVE_MIC_DATA (0xF1)
+    """
+    if len(data) < 2:
+        logging.warning(
+            f"Invalid data length for RECEIVE_MIC_DATA command from {glass.side}"
+        )
+        return
+
+    seq = data[1]
+    mic_data = data[2:]
+
+    logging.info(
+        f"RECEIVE_MIC_DATA from {glass.side}: seq={seq}, data_length={len(mic_data)}"
+    )
+    # Implement your logic here (e.g., buffering audio data)
+
+
+async def handle_send_result(
+    glass: Glass, sender: Union[UUID, int, str], data: bytes
+) -> None:
+    """
+    Handle the SEND_RESULT command.
+
+    Command: SEND_RESULT (0x4E)
+    """
+    if len(data) < 9:
+        logging.warning(
+            f"Invalid data length for SEND_RESULT command from {glass.side}"
+        )
+        return
+
+    # Parse command fields
+    seq = data[1]
+    total_packages = data[2]
+
+    logging.info(
+        f"SEND_RESULT from {glass.side}: seq={seq}, total_packages={total_packages}, "
+    )
+    # Implement your logic here
+
+
+async def handle_quick_note(
+    glass: Glass, sender: Union[UUID, int, str], data: bytes
+) -> None:
+    """
+    Handle the QUICK_NOTE command.
+
+    Command: QUICK_NOTE (0x21)
+    """
+    logging.info(f"QUICK_NOTE received from {glass.side}")
+    # Implement your logic here
+
+
+async def handle_dashboard(
+    glass: Glass, sender: Union[UUID, int, str], data: bytes
+) -> None:
+    """
+    Handle the DASHBOARD command.
+
+    Command: DASHBOARD (0x22)
+    """
+    logging.info(f"DASHBOARD command received from {glass.side}")
+    # Implement your logic here
+
+
+async def handle_notification(
+    glass: Glass, sender: Union[UUID, int, str], data: bytes
+) -> None:
+    """
+    Handle the NOTIFICATION command.
+
+    Command: NOTIFICATION (0x4B)
+    """
+    if len(data) < 4:
+        logging.warning(
+            f"Invalid data length for NOTIFICATION command from {glass.side}"
+        )
+        return
+
+    notify_id = data[1]
+    total_chunks = data[2]
+    current_chunk = data[3]
+    notification_content = data[4:]
+
+    logging.info(
+        f"NOTIFICATION from {glass.side}: notify_id={notify_id}, total_chunks={total_chunks}, "
+        f"current_chunk={current_chunk}, content_length={len(notification_content)}"
+    )
+    # Implement your logic here
+
+
+async def handle_init(glass: Glass, sender: Union[UUID, int, str], data: bytes) -> None:
+    """
+    Handle the INIT command.
+
+    Command: INIT (0x4D)
+    """
+    logging.info(f"INIT command received from {glass.side}")
+    # Implement your logic here
+
+
+# Mapping of commands to handler functions
+COMMAND_HANDLERS: Dict[
+    Command, Callable[[bytes, Union[UUID, int, str], str], Awaitable[None]]
+] = {
+    Command.HEARTBEAT: handle_heartbeat,
+    Command.START_AI: handle_start_ai,
+    Command.OPEN_MIC: handle_open_mic,
+    Command.MIC_RESPONSE: handle_mic_response,
+    Command.RECEIVE_MIC_DATA: handle_receive_mic_data,
+    Command.INIT: handle_init,
+    Command.SEND_RESULT: handle_send_result,
+    Command.QUICK_NOTE: handle_quick_note,
+    Command.DASHBOARD: handle_dashboard,
+    Command.NOTIFICATION: handle_notification,
+    # Add other command handlers as necessary
+}
+
+
+async def handle_incoming_notification(
+    glass: Glass, sender: Union[UUID, int, str], data: Union[bytes, bytearray]
+) -> None:
+    if DEBUG:
+        debug_command_logs(glass.side, sender, data)
+
+    if isinstance(data, bytearray):
+        data = bytes(data)
+
+    # Extract the command byte from the data
+    if not data:
+        logging.warning("No data received in notification")
+        return
+
+    command_byte = data[0]
+    try:
+        command = Command(command_byte)
+    except ValueError:
+        logging.warning(
+            f"Unknown command: 0x{command_byte:02X} received from {glass.side}"
+        )
+        return
+
+    handler = COMMAND_HANDLERS.get(command)
+    if handler:
+        await handler(glass, sender, data)
+    else:
+        logging.warning(
+            f"No handler for command: {command.name} (0x{command_byte:02X}) received from {glass.side}"
+        )
+
+```
+
+`/Users/shawwalters/even-g1/even_glasses/README.md`:
+
+```md
+
+# Even Demo
+
+## Even AI
+The general process of the Even AI function is as follows: After the app and glasses are 
+connected via dual Bluetooth, long press the left-side TouchBar on the glasses to enter the 
+Even AI activation state. At this point, the app will receive the [0xF5, 0x17] command from the 
+glasses. The app then needs to send a command [0x0E, 0x01] to the glasses to activate the 
+right-side microphone for recording. Once the microphone is successfully activated, the app 
+will receive a real-time audio stream in LC3 format. Keep pressing until speaking is finished, 
+the maximum supported recording duration is 30 seconds. After the recording is finished, the 
+app needs to convert the audio stream into text, which is then sent to the large model for a 
+response. After the app successfully obtains the response from the large model, it can send 
+the result to the glasses according to the Bluetooth protocol. By default, the result is 
+transmitted automatically, page by page. During transmission, a single tap on the TouchBar 
+will switch to manual mode, with the left-side TouchBar used for page-up and the right-side 
+TouchBar for page-down. A double-tap on the TouchBar will directly exit the Even AI function.
+
+## Image Sending
+Image transmission currently supports 1-bit, 576*136 pixel BMP images (refer to image_1.bmp, image_2.bmp in the project). 
+The core process includes three steps: 
+- 1. Divide the BMP image data into packets (each packet is 194 bytes), then add 0x15 command and syncID to the front of the packet, and send it to the dual BLE in the order of the packets (the left and right sides can be sent independently at the same time). The first packet needs to insert 4 bytes of glasses end storage address 0x00, 0x1c, 0x00, 0x00, so the first packet data is ([0x15, index & 0xff, 0x00, 0x1c, 0x00, 0x00], pack), and other packets do not need addresses 0x00, 0x1c, 0x00, 0x00;
+- 2. After sending the last packet, it is necessary to send the packet end command [0x20, 0x0d, 0x0e] to the dual BLE;
+- 3. After the packet end command in step 2 is correctly replied, send the CRC check command to the dual BLE through the 0x16 command. When calculating the CRC, it is necessary to consider the glasses end storage address added when sending the first BMP packet.
+     
+For a specific example, click the icon in the upper right corner of the App homepage to enter the Features page. The page contains three buttons: BMP 1, BMP 2, and Exit, which represent the transmission and display of picture 1, the transmission and display of picture 2, and the exit of picture transmission and display.
+
+
+## Instructions
+G1’s dual Bluetooth communication is unique, each arm corresponds to a separate BLE 
+connection. During communication, unless the protocol specifies sending data to only one 
+side (e.g., microphone activation to the right), the app should: 
+- First send data to the left side. 
+- Then send data to the right side after receiving a successful acknowledgment from the left. 
+ Also, consider the glasses' display width limitation: during the Even AI function, the 
+maximum width is 488 pixels, with eac
+
+
+
+
+## Protocol
+### Start Even AI 
+#### Command Information 
+ - Command: 0xF5
+   - subcmd (Sub-command): 0~255
+   - param (Parameters): Specific parameters associated with each sub-command.
+#### Sub-command Descriptions 
+ - subcmd: 0 (exit to dashboard manually).
+   - Description: Stop all advanced features and return to the dashboard. 
+ - subcmd: 1 (page up/down control in manual mode). 
+   - Description: page-up(left ble) / page-down (right ble) 
+- subcmd: 23 （start Even AI).
+   - Description: Notify phone to activate Even AI. 
+- subcmd: 24 （stop Even AI recording).
+   - Description: Even AI recording ended.
+
+### Open Glasses Mic 
+#### Command Information 
+ - Command: 0x0E
+ - enable:
+   - 0 (Disable) / 1 (Enable)
+#### Description 
+ - enable: 
+   - 0: Disable the MIC (turn off sound pickup). 
+   - 1: Enable the MIC (turn on sound pickup). 
+#### Response from Glasses 
+ - Command: 0x0E
+ - rsp_status (Response Status): 
+   - 0xC9: Success
+   - 0xCA: Failure
+ - enable: 
+   - 0: MIC disabled.
+   - 1: MIC enabled.
+#### Example 
+ - Command sent to device: 0x0E, with enable = 1 to enable the MIC. 
+ - Device response: 
+   - If successful: 0x0E with rsp_status = 0xC9 and enable = 1. 
+   - If failed: 0x0E with rsp_status = 0xCA and enable = 1.
+   
+### Receive Glasses Mic data 
+#### Command Information 
+ - Command: 0xF1
+ - seq (Sequence Number): 0~255
+ - data (Audio Data): Actual MIC audio data being transmitted. 
+#### Field Descriptions 
+- seq (Sequence Number): 
+   - Range: 0~255
+   - Description: This is the sequence number of the current data packet. It helps to ensure 
+the order of the audio data being received. 
+- data (Audio Data): 
+   - Description: The actual audio data captured by the MIC, transmitted in chunks according 
+to the sequence. 
+#### Example 
+- Command: 0xF1, with seq = 10 and data = [Audio Data] 
+- Description: This command transmits a chunk of audio data from the glasses' MIC, with a 
+sequence number of `10` to maintain packet order. 
+
+### Send AI Result 
+#### Command Information 
+ - Command: 0x4E
+ - seq (Sequence Number): 0~255
+ - total_package_num (Total Package Count): 1~255
+ - current_package_num (Current Package Number): 0~255
+ - newscreen (Screen Status) 
+#### Field Descriptions 
+ - seq (Sequence Number): 
+   - Range: 0~255
+   - Description: Indicates the sequence of the current package. 
+ - total_package_num (Total Package Count): 
+   - Range: 1~255
+   - Description: The total number of packages being sent in this transmission. 
+ - current_package_num (Current Package Number): 
+   - Range: 0~255 
+   - Description: The current package number within the total, starting from 0. 
+ - newscreen (Screen Status): 
+   - Composed of lower 4 bits and upper 4 bits to represent screen status and Even AI 
+mode. 
+   ##### Lower 4 Bits (Screen Action): 
+      - 0x01: Display new content
+ 
+   ##### Upper 4 Bits (Even AI Status): 
+      - 0x30: Even AI displaying（automatic mode default）
+      - 0x40: Even AI display complete (Used when the last page of automatic mode) 
+      - 0x50: Even AI manual mode 
+      - 0x60: Even AI network error
+   
+   ##### Example:
+   - New content + Even AI displaying state is represented as 0x31.
+- new_char_pos0 and new_char_pos1: 
+   - new_char_pos0: Higher 8 bits of the new character position. 
+   - new_char_pos1: Lower 8 bits of the new character position. 
+- current_page_num (Current Page Number): 
+   - Range: 0~255
+   - Description: Represents the current page number. 
+- max_page_num (Maximum Page Number): 
+   - Range: 1~255 
+   - Description: The total number of pages. 
+- data (Data): 
+   - Description: The actual data being transmitted in this package.
+
+### Send bmp data packet 
+#### Command Information 
+ - Command: 0x15
+ - seq (Sequence Number): 0~255
+ - address: [0x00, 0x1c, 0x00, 0x00]
+ - data0 ~ data194 
+#### Field Descriptions 
+ - seq (Sequence Number): 
+   - Range: 0~255
+   - Description: Indicates the sequence of the current package.
+ - address:
+   bmp address in the Glasses (just attached in the first pack)
+ - data0 ~ data194:
+   - bmp data packet
+
+### Bmp data packet transmission ends 
+#### Command Information 
+ - Command: 0x20
+ - data0: 0x0d
+ - data1: 0x0e
+#### Field Descriptions 
+ - Fixed format command： [0x20, 0x0d, 0x0e]
+
+### CRC Check 
+#### Command Information 
+ - Command: 0x16
+ - crc 
+#### Field Descriptions 
+ - crc:
+   The crc check value calculated using Crc32Xz big endian, combined with the bmp picture storage address and picture data.
+```
+
+`/Users/shawwalters/even-g1/even_glasses/rsvp_story.txt`:
+
+```txt
+The Code Breaker’s Dilemma
+
+Alex’s fingers hovered over the keyboard, sweat beading on his forehead as the clock ticked relentlessly. The final lines of code blurred before his exhausted eyes, and the critical error message flashed ominously on the screen: “System Failure: Access Denied.” He had less than an hour to fix the glitch, or months of hard work would crumble into digital dust.
+
+Just a year ago, Alex couldn’t tell a for-loop from a firewall. He had always been fascinated by technology but felt daunted by the complexity of programming languages. Growing up in a small town where opportunities were scarce, he often heard that big dreams were for people with connections or exceptional talents—neither of which he believed he possessed.
+
+But everything changed the day he stumbled upon an old laptop at a garage sale. It was battered, keys missing, and the screen flickered unpredictably. Yet, there was something intriguing about it. The seller mentioned it had belonged to a retired programmer who had worked on some groundbreaking projects in the early days of the internet.
+
+Curiosity piqued, Alex bought the laptop for a few dollars. That night, as he powered it up, strange lines of code greeted him, along with a cryptic message: “The key lies not in the code, but in the coder.”
+
+Intrigued, he began to explore the laptop’s contents. It was filled with programs, scripts, and notes that seemed like riddles. Without formal training, Alex struggled to understand, but he was determined. He started researching online tutorials, forums, and any resources he could find to decipher the mysteries within the old machine.
+
+Days turned into weeks, and weeks into months. Alex spent every spare moment learning about programming languages, algorithms, and cybersecurity. He faced countless obstacles—bugs he couldn’t squash, concepts he couldn’t grasp, and times when the code simply wouldn’t compile. Frustration gnawed at him, but so did an insatiable curiosity.
+
+One evening, after yet another failed attempt to solve a particularly stubborn problem, Alex felt ready to quit. He slammed the laptop shut and gazed out the window. The night sky was clear, stars twinkling like bits of code in the vast expanse. He thought about the cryptic message: “The key lies not in the code, but in the coder.”
+
+What did it mean? Was he missing something obvious? Then it struck him—the problem wasn’t the code; it was his mindset. He was so fixated on finding the right answers that he wasn’t asking the right questions. He realized that programming wasn’t just about syntax and commands; it was about problem-solving, creativity, and perseverance.
+
+With renewed determination, Alex reopened the laptop. This time, he approached the problem differently. He broke it down into smaller parts, analyzed each component, and began to see patterns he hadn’t noticed before. Slowly but steadily, he started making progress.
+
+As months passed, Alex’s skills grew exponentially. He began working on small projects, then more complex ones. He even started contributing to open-source communities, where his innovative solutions caught the attention of seasoned programmers.
+
+One day, he received an email from a tech startup in the city. They had noticed his contributions online and were impressed by his ingenuity. They invited him to join a team working on cutting-edge cybersecurity software. It was an opportunity beyond his wildest dreams.
+
+Fast forward to the present, Alex was now leading a crucial project aimed at protecting users from a new, sophisticated cyber threat. The software they were developing had the potential to revolutionize digital security. But now, with the deadline looming and the critical error unresolved, everything was at stake.
+
+He took a deep breath, closed his eyes, and recalled his journey—the challenges he had overcome, the nights spent debugging, the thrill of finally cracking a tough problem. He reminded himself that he had faced obstacles before and had always found a way through.
+
+Opening his eyes, Alex began to methodically review the code. Line by line, he traced the logic, looking for inconsistencies. Suddenly, he noticed a subtle discrepancy in the authentication module. A single misplaced character—an overlooked semicolon—was causing the entire system to fail.
+
+He corrected the error and reran the program. The screen flickered, and for a moment, he held his breath. Then, the message changed: “System Operational: Access Granted.”
+
+Relief washed over him. He quickly finalized the project, uploaded the secure build, and notified the team. They had done it—the software was ready for launch.
+
+The success of the project propelled Alex’s career to new heights. He was hailed as a genius, a prodigy who had emerged from obscurity to make significant contributions to the tech world. But Alex knew the truth—it wasn’t genius that had brought him here, but grit, passion, and an unwavering belief in his ability to learn and grow.
+
+Reflecting on his journey, Alex decided to share his story with others who, like him, might feel that their dreams are out of reach. He started a blog, writing about his experiences, the challenges he faced, and the strategies he used to overcome them. His authenticity resonated with readers around the world.
+
+One day, he received a message from a young woman named Maya. She wrote, “Your story inspired me to pursue my interest in programming. I was always told that tech isn’t for people like me, but you’ve shown me that’s not true. Thank you for giving me the courage to start.”
+
+Alex smiled. He realized that his journey wasn’t just about personal success; it was about inspiring others to discover their potential. He began hosting webinars, offering mentorship, and creating accessible learning resources for aspiring programmers.
+
+His initiatives led to the formation of a global community of learners and innovators. Together, they collaborated on projects, shared knowledge, and supported each other through challenges. The community became a hub for creativity and problem-solving, tackling real-world issues with technological solutions.
+
+One of their projects focused on developing educational software for underprivileged schools. They created interactive platforms that made learning fun and accessible, bridging gaps in education through technology. The impact was profound, opening doors for thousands of children who previously had limited opportunities.
+
+Through it all, Alex remained humble. He often recalled the old laptop that started it all and the cryptic message that had guided him: “The key lies not in the code, but in the coder.” He understood now that it meant the true power of technology comes from the people who wield it—their determination, creativity, and willingness to persevere.
+
+In a keynote speech at a major tech conference, Alex shared this insight. “Technology is a tool,” he said. “But it’s the human spirit—the coder behind the code—that drives innovation. Each of us has the potential to create, to solve problems, and to make a difference. Don’t let self-doubt or external limitations hold you back. Believe in yourself, embrace challenges, and keep pushing forward.”
+
+The audience erupted in applause. Many were inspired, seeing in Alex’s journey a reflection of their own aspirations and struggles. His message ignited a spark of motivation, encouraging others to pursue their passions despite obstacles.
+
+Backstage after the speech, Alex was approached by an elderly man who introduced himself as the original owner of the old laptop. “I’ve been following your work,” he said, eyes twinkling. “I left that message years ago, hoping someone like you would find it.”
+
+Alex was stunned. “You knew?”
+
+The man nodded. “I wanted to pass on the torch, to inspire the next generation of innovators. And you’ve exceeded all my expectations.”
+
+They talked for hours, sharing stories and insights. The encounter felt like the closing of a circle and the beginning of a new chapter. Alex realized that his journey was part of a larger continuum—a legacy of knowledge and inspiration passed down through generations.
+
+As he continued his work, Alex remained committed to empowering others. He understood that success wasn’t just about personal achievements but about lifting others up along the way. His story became a testament to the power of self-motivation, perseverance, and the impact one individual can have on the world.
+
+In the end, Alex’s greatest accomplishment wasn’t the groundbreaking software he developed or the accolades he received. It was the lives he touched, the barriers he helped break down, and the spark of inspiration he ignited in others.
+
+And so, the code breaker’s dilemma wasn’t about fixing a system error—it was about unlocking human potential. The key, as he had learned, truly lay not in the code, but in the coder.
+
+Epilogue
+
+Years later, Alex sat in his office overlooking a bustling cityscape—a testament to the technological advancements he had helped foster. A new message flashed on his screen from a young coder seeking advice. Alex smiled and began typing, ready to guide another aspiring mind.
+
+The legacy continued, a chain of inspiration unbroken, proving that with self-motivation and determination, anyone can turn a simple curiosity into a force for change.
+```
+
+`/Users/shawwalters/even-g1/even_glasses/bluetooth_manager.py`:
+
+```py
+import asyncio
+import logging
+from bleak import BleakClient, BleakScanner
+from bleak.exc import BleakError
+from typing import Optional, Callable
+from even_glasses.models import DesiredConnectionState
+
+from even_glasses.utils import construct_heartbeat
+from even_glasses.service_identifiers import (
+    UART_SERVICE_UUID,
+    UART_TX_CHAR_UUID,
+    UART_RX_CHAR_UUID,
+)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class BleDevice:
+    """Base class for BLE device communication."""
+
+    def __init__(self, name: str, address: str):
+        self.name = name
+        self.address = address
+        self.client = BleakClient(
+            address,
+            disconnected_callback=self._handle_disconnection,
+        )
+        self.uart_tx = None
+        self.uart_rx = None
+        self._write_lock = asyncio.Lock()
+        self.notifications_started = False
+        self.desired_connection_state = DesiredConnectionState.DISCONNECTED
+
+    async def connect(self):
+        logger.info(f"Connecting to {self.name} ({self.address})")
+        try:
+            await self.client.connect()
+            logger.info(f"Connected to {self.name}")
+
+            # Discover services
+            await self.client.get_services()
+            services = self.client.services
+
+            uart_service = services.get_service(UART_SERVICE_UUID)
+            if not uart_service:
+                raise BleakError(f"UART service not found for {self.name}")
+
+            self.uart_tx = uart_service.get_characteristic(UART_TX_CHAR_UUID)
+            self.uart_rx = uart_service.get_characteristic(UART_RX_CHAR_UUID)
+
+            if not self.uart_tx or not self.uart_rx:
+                raise BleakError(f"UART TX/RX characteristics not found for {self.name}")
+
+            await self.start_notifications()
+        except Exception as e:
+            logger.error(f"Error connecting to {self.name}: {e}")
+            await self.disconnect()
+            raise
+
+    async def disconnect(self):
+        """Gracefully disconnect from the BLE device, stopping notifications if they are active."""
+        try:
+            # Check if notifications are started and `uart_rx` exists before stopping them
+            if self.notifications_started and self.uart_rx:
+                try:
+                    await self.client.stop_notify(self.uart_rx)
+                    logger.info(f"Stopped notifications for {self.name}")
+                except Exception as e:
+                    logger.warning(f"Failed to stop notifications for {self.name}: {e}")
+                finally:
+                    self.notifications_started = False
+
+            # Check if the client is still connected before attempting to disconnect
+            if self.client.is_connected:
+                await self.client.disconnect()
+                logger.info(f"Disconnected from {self.name}")
+        except Exception as e:
+            logger.error(f"Error during disconnection for {self.name}: {e}")
+
+    def _handle_disconnection(self, client: BleakClient):
+        logger.warning(f"Device {self.name} disconnected")
+        if self.desired_connection_state == DesiredConnectionState.CONNECTED:
+            asyncio.create_task(self.reconnect())
+
+    async def reconnect(self):
+        retries = 3
+        for attempt in range(1, retries + 1):
+            try:
+                logger.info(f"Reconnecting to {self.name} (Attempt {attempt}/{retries})")
+                await self.connect()
+                logger.info(f"Reconnected to {self.name}")
+                return
+            except Exception as e:
+                logger.error(f"Reconnection attempt {attempt} failed: {e}")
+                await asyncio.sleep(5)
+        logger.error(f"Failed to reconnect to {self.name} after {retries} attempts")
+
+    async def start_notifications(self):
+        if not self.notifications_started and self.uart_rx:
+            try:
+                await self.client.start_notify(self.uart_rx, self.handle_notification)
+                self.notifications_started = True
+                logger.info(f"Notifications started for {self.name}")
+            except Exception as e:
+                logger.error(f"Failed to start notifications for {self.name}: {e}")
+
+    async def send(self, data: bytes) -> bool:
+        if not self.client.is_connected:
+            logger.warning(f"Cannot send data, {self.name} is disconnected.")
+            return False
+
+        if not self.uart_tx:
+            logger.warning(f"No TX characteristic available for {self.name}.")
+            return False
+
+        try:
+            async with self._write_lock:
+                await self.client.write_gatt_char(self.uart_tx, data, response=True)
+            logger.info(f"Data sent to {self.name}: {data.hex()}")
+            return True
+        except Exception as e:
+            logger.error(f"Error sending data to {self.name}: {e}")
+            return False
+
+    async def handle_notification(self, sender: int, data: bytes):
+        ...
+
+
+class Glass(BleDevice):
+    """Class representing a single glass device."""
+
+    def __init__(
+        self,
+        name: str,
+        address: str,
+        side: str,
+        heartbeat_freq: int = 5,
+    ):
+        super().__init__(name, address)
+        self.side = side
+        self.heartbeat_freq = heartbeat_freq
+        self.heartbeat_task: Optional[asyncio.Task] = None
+        self.notification_handler: Optional[Callable[[int, bytes], None]] = None
+        
+
+    async def start_heartbeat(self):
+        if self.heartbeat_task is None or self.heartbeat_task.done():
+            self.heartbeat_task = asyncio.create_task(self._heartbeat())
+
+    async def _heartbeat(self):
+        while self.client.is_connected:
+            try:
+                heartbeat = construct_heartbeat(1)
+                await self.send(heartbeat)
+                await asyncio.sleep(self.heartbeat_freq)
+            except Exception as e:
+                logger.error(f"Heartbeat error for {self.name}: {e}")
+                break
+
+    async def connect(self):
+        await super().connect()
+        await self.start_heartbeat()
+
+    async def disconnect(self):
+        if self.heartbeat_task and not self.heartbeat_task.done():
+            self.heartbeat_task.cancel()
+            try:
+                await self.heartbeat_task
+            except asyncio.CancelledError:
+                pass
+        await super().disconnect()
+    
+    async def handle_notification(self, sender: int, data: bytes):
+        logger.info(f"Notification from {self.name}: {data.hex()}")
+        if self.notification_handler:
+            await self.notification_handler(self,sender, data)
+
+
+class GlassesManager:
+    """Class to manage both left and right glasses."""
+
+    def __init__(
+        self,
+        left_address: str = None,
+        right_address: str = None,
+        left_name: str = "G1 Left Glass",
+        right_name: str = "G1 Right Glass",
+    ):
+        self.left_glass: Optional[Glass] = (
+            Glass(name=left_name, address=left_address, side="left")
+            if left_address
+            else None
+        )
+        self.right_glass: Optional[Glass] = (
+            Glass(name=right_name, address=right_address, side="right")
+            if right_address
+            else None
+        )
+
+    async def scan_and_connect(self, timeout: int = 10) -> bool:
+        """Scan for glasses devices and connect to them."""
+        try:
+            logger.info("Scanning for glasses devices...")
+            devices = await BleakScanner.discover(timeout=timeout)
+            for device in devices:
+                device_name = device.name or "Unknown"
+                logger.info(f"Found device: {device_name}, Address: {device.address}")
+                if "_L_" in device_name and not self.left_glass:
+                    self.left_glass = Glass(name=device_name, address=device.address, side="left")
+                elif "_R_" in device_name and not self.right_glass:
+                    self.right_glass = Glass(name=device_name, address=device.address, side="right")
+
+            connect_tasks = []
+            if self.left_glass:
+                connect_tasks.append(asyncio.create_task(self.left_glass.connect()))
+            if self.right_glass:
+                connect_tasks.append(asyncio.create_task(self.right_glass.connect()))
+
+            if connect_tasks:
+                self.desired_connection_state = DesiredConnectionState.CONNECTED
+                await asyncio.gather(*connect_tasks)
+                logger.info("All glasses connected successfully.")
+                return True
+            else:
+                logger.error("No glasses devices found during scan.")
+                return False
+        except Exception as e:
+            logger.error(f"Error during scan and connect: {e}")
+            return False
+
+    async def disconnect_all(self):
+        """Disconnect from all connected glasses."""
+        disconnect_tasks = []
+        if self.left_glass and self.left_glass.client.is_connected:
+            disconnect_tasks.append(asyncio.create_task(self.left_glass.disconnect()))
+        if self.right_glass and self.right_glass.client.is_connected:
+            disconnect_tasks.append(asyncio.create_task(self.right_glass.disconnect()))
+        if disconnect_tasks:
+            try:
+                self.desired_connection_state = DesiredConnectionState.DISCONNECTED
+                await asyncio.gather(*disconnect_tasks)
+                logger.info("All glasses disconnected.")
+            except Exception as e:
+                logger.error(f"Error during disconnecting all glasses: {e}")
+
+
+# Example Usage
+async def main():
+    manager = GlassesManager()
+    connected = await manager.scan_and_connect()
+    if connected:
+        try:
+            while True:
+                # Replace with your actual logic
+                await asyncio.sleep(1)
+        except KeyboardInterrupt:
+            logger.info("Interrupted by user.")
+        finally:
+            await manager.disconnect_all()
+    else:
+        logger.error("Failed to connect to glasses.")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+`/Users/shawwalters/even-g1/even_glasses/utils.py`:
+
+```py
+import struct
+import asyncio
+from typing import List
+from even_glasses.models import (
+    Command,
+    NCSNotification,
+    Notification,
+    NoteAdd,
+    SubCommand,
+    MicStatus,
+    SendResult,
+    SilentModeStatus,
+    BrightnessAuto,
+    DashboardState,
+    GlassesWearStatus,
+)
+import numpy as np
+import numba
+
+
+def construct_heartbeat(seq: int) -> bytes:
+    length = 6
+    return struct.pack(
+        "BBBBBB",
+        Command.HEARTBEAT,
+        length & 0xFF,
+        (length >> 8) & 0xFF,
+        seq % 0xFF,
+        0x04,
+        seq % 0xFF,
+    )
+
+
+async def construct_notification(ncs_notification=NCSNotification):
+    # Create Notification instance
+    notification = Notification(ncs_notification=ncs_notification, type="Add")
+
+    # Get notification chunks
+    chunks = await notification.construct_notification()
+    return chunks
+
+
+def construct_headup_angle(angle: int) -> bytes:
+    """Construct command to set head-up display angle."""
+    if not 0 <= angle <= 60:
+        raise ValueError("Angle must be between 0 and 60 degrees")
+    angle_byte = angle & 0xFF
+    return bytes([Command.HEADUP_ANGLE, angle_byte, 0x01])
+
+
+def construct_note_delete(note_number: int) -> bytes:
+    """Construct command to delete a note with the given number."""
+    if not 1 <= note_number <= 4:
+        raise ValueError("Note number must be between 1 and 4")
+    return bytes(
+        [
+            0x1E,
+            0x10,
+            0x00,
+            0xE0,
+            0x03,
+            0x01,
+            0x00,
+            0x01,
+            0x00,
+            note_number,
+            0x00,
+            0x01,
+            0x00,
+            0x01,
+            0x00,
+            0x00,
+        ]
+    )
+
+
+def construct_note_add(note_number: int, name: str, text: str) -> bytes:
+    """Construct command to add or change a note with a name and text."""
+    note_add = NoteAdd(note_number=note_number, name=name, text=text)
+    return note_add.build()
+
+def construct_glasses_wear_command(status: GlassesWearStatus) -> bytes:
+    """Construct command to set glasses wear detection."""
+    return bytes([Command.GLASSES_WEAR, status])
+
+
+def construct_clear_screen() -> bytes:
+    """Construct command to clear the screen."""
+    return bytes(
+        [
+            Command.START_AI,
+            SubCommand.STOP,
+            0x00,
+            0x00,
+            0x00,
+        ]
+    )
+
+
+def construct_start_ai(subcmd: SubCommand, param: bytes = b"") -> bytes:
+    return bytes([Command.START_AI, subcmd]) + param
+
+
+def construct_mic_command(enable: MicStatus) -> bytes:
+    return bytes([Command.OPEN_MIC, enable])
+
+
+def construct_result(result: SendResult) -> bytes:
+    return result.build()
+
+
+def construct_silent_mode(status: SilentModeStatus) -> bytes:
+    """Construct command to set silent mode."""
+    return bytes([Command.SILENT_MODE, status, 0x00])
+
+
+def construct_brightness(level: int, auto: BrightnessAuto) -> bytes:
+    """Construct command to set brightness with auto setting."""
+    if not 0x00 <= level <= 0x29:
+        raise ValueError("Brightness level must be between 0x00 and 0x29")
+    return bytes([Command.BRIGHTNESS, level, auto])
+
+
+def construct_dashboard_show_state(state: DashboardState, position: int) -> bytes:
+    """Construct command to show or hide the dashboard with position."""
+    state_value = 0x01 if state == DashboardState.ON else 0x00
+    return bytes(
+        [Command.DASHBOARD_POSITION, 0x07, 0x00, 0x01, 0x02, state_value, position]
+    )
+
+@numba.njit
+def crc32_numba(data):
+    """Compute CRC32 using Numba JIT compilation."""
+    crc = 0xFFFFFFFF
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            if crc & 1:
+                crc = (crc >> 1) ^ 0xEDB88320
+            else:
+                crc >>= 1
+    return crc ^ 0xFFFFFFFF
+
+@numba.njit
+def divide_image_data_numba(data_array, packet_size):
+    """Divide image data into packets using Numba."""
+    total_length = data_array.shape[0]
+    num_packets = (total_length + packet_size - 1) // packet_size
+    packets = []
+    for i in range(num_packets):
+        start = i * packet_size
+        end = min(start + packet_size, total_length)
+        packet = data_array[start:end]
+        packets.append(packet)
+    return packets
+
+def divide_image_data(image_data: bytes) -> List[np.ndarray]:
+    """Divide image data into packets of 194 bytes using NumPy."""
+    packet_size = 194
+    data_array = np.frombuffer(image_data, dtype=np.uint8)
+    # Use Numba-optimized function
+    packets = divide_image_data_numba(data_array, packet_size)
+    return packets
+
+@numba.njit
+def construct_bmp_data_packet_numba(seq, data_packet, is_first_packet):
+    """Construct BMP data packet with command 0x15 using Numba."""
+    command = 0x15
+    seq_byte = seq & 0xFF
+    if is_first_packet:
+        address = np.array([0x00, 0x1C, 0x00, 0x00], dtype=np.uint8)
+        packet_header = np.array([command, seq_byte], dtype=np.uint8)
+        full_packet = np.concatenate((packet_header, address, data_packet))
+    else:
+        packet_header = np.array([command, seq_byte], dtype=np.uint8)
+        full_packet = np.concatenate((packet_header, data_packet))
+    return full_packet
+
+def construct_bmp_data_packet(seq: int, data_packet: np.ndarray, is_first_packet: bool) -> np.ndarray:
+    """Construct BMP data packet with command 0x15."""
+    return construct_bmp_data_packet_numba(seq, data_packet, is_first_packet)
+
+def construct_packet_end_command() -> bytes:
+    """Construct packet end command [0x20, 0x0d, 0x0e]."""
+    return bytes([0x20, 0x0D, 0x0E])
+
+@numba.njit
+def construct_crc_check_command_numba(image_data_array):
+    """Construct CRC check command with command 0x16 using Numba."""
+    command = 0x16
+    address = np.array([0x00, 0x1C, 0x00, 0x00], dtype=np.uint8)
+    crc_data = np.concatenate((address, image_data_array))
+    crc = crc32_numba(crc_data) & 0xFFFFFFFF
+    crc_bytes = np.array([
+        (crc >> 24) & 0xFF,
+        (crc >> 16) & 0xFF,
+        (crc >> 8) & 0xFF,
+        crc & 0xFF
+    ], dtype=np.uint8)
+    full_command = np.concatenate((np.array([command], dtype=np.uint8), crc_bytes))
+    return full_command
+
+def construct_crc_check_command(image_data_array: np.ndarray) -> bytes:
+    """Construct CRC check command with command 0x16."""
+    command_array = construct_crc_check_command_numba(image_data_array)
+    return command_array.tobytes()
+
+async def send_data_to_glass(glass, data_packets: List[np.ndarray], full_image_array: np.ndarray):
+    """Send data packets to a single glass."""
+    # Send all data packets sequentially
+    for data_packet in data_packets:
+        await glass.send(data_packet.tobytes())
+    # Send packet end command
+    packet_end_command = construct_packet_end_command()
+    await glass.send(packet_end_command)
+    # Wait for acknowledgment (implement according to your protocol)
+    await asyncio.sleep(0.00001)
+    # Send CRC check command
+    crc_check_command = construct_crc_check_command(full_image_array)
+    await glass.send(crc_check_command)
+```
+
+`/Users/shawwalters/even-g1/even_glasses/commands.py`:
+
+```py
+from even_glasses.models import (
+    SendResult,
+    ScreenAction,
+    AIStatus,
+    RSVPConfig,
+    NCSNotification,
+    SilentModeStatus,
+    BrightnessAuto,
+    DashboardState,
+    GlassesWearStatus,
+)
+import asyncio
+import logging
+from typing import List
+from even_glasses.utils import (
+    construct_note_add,
+    construct_silent_mode,
+    construct_brightness,
+    construct_dashboard_show_state,
+    construct_headup_angle,
+    construct_note_delete,
+    construct_notification,
+    construct_glasses_wear_command,
+    divide_image_data,
+    construct_bmp_data_packet,
+    send_data_to_glass,
+)
+import numpy as np
+
+
+def format_text_lines(text: str) -> list:
+    """Format text into lines that fit the display."""
+    paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
+    lines = []
+
+    for paragraph in paragraphs:
+        while len(paragraph) > 40:
+            space_idx = paragraph.rfind(" ", 0, 40)
+            if space_idx == -1:
+                space_idx = 40
+            lines.append(paragraph[:space_idx])
+            paragraph = paragraph[space_idx:].strip()
+        if paragraph:
+            lines.append(paragraph)
+
+    return lines
+
+
+async def send_text_packet(
+    manager,
+    text_message: str,
+    page_number: int = 1,
+    max_pages: int = 1,
+    screen_status: int = ScreenAction.NEW_CONTENT | AIStatus.DISPLAYING,
+    wait: float = 2,
+    delay: float = 0.4,
+    seq: int = 0,
+) -> str:
+    text_bytes = text_message.encode("utf-8")
+
+    result = SendResult(
+        seq=seq,
+        total_packages=1,
+        current_package=0,
+        screen_status=screen_status,
+        new_char_pos0=0,
+        new_char_pos1=0,
+        page_number=page_number,
+        max_pages=max_pages,
+        data=text_bytes,
+    )
+    ai_result_command = result.build()
+
+    if manager.left_glass and manager.right_glass:
+        # Send to the left glass and wait for acknowledgment
+        await manager.left_glass.send(ai_result_command)
+        await asyncio.sleep(delay)
+        # Send to the right glass and wait for acknowledgment
+        await manager.right_glass.send(ai_result_command)
+        await asyncio.sleep(delay)
+
+        return text_message
+    else:
+        logging.error("Could not connect to glasses devices.")
+        return False
+
+
+async def send_text(manager, text_message: str, duration: float = 5) -> str:
+    """Send text message to the glasses display."""
+    lines = format_text_lines(text_message)
+    total_pages = (len(lines) + 4) // 5  # 5 lines per page
+
+    if total_pages > 1:
+        logging.info(f"Sending {total_pages} pages with {duration} seconds delay")
+        screen_status = AIStatus.DISPLAYING | ScreenAction.NEW_CONTENT
+        await send_text_packet(
+            manager=manager,
+            text_message=lines[0],
+            page_number=1,
+            max_pages=total_pages,
+            screen_status=screen_status,
+        )
+        await asyncio.sleep(0.1)
+
+    for pn, page in enumerate(range(0, len(lines), 5), start=1):
+        page_lines = lines[page : page + 5]
+
+        # Add vertical centering for pages with fewer than 5 lines
+        if len(page_lines) < 5:
+            padding = (5 - len(page_lines)) // 2
+            page_lines = (
+                [""] * padding + page_lines + [""] * (5 - len(page_lines) - padding)
+            )
+
+        text = "\n".join(page_lines)
+        screen_status = AIStatus.DISPLAYING
+
+        await send_text_packet(
+            manager=manager,
+            text_message=text,
+            page_number=pn,
+            max_pages=total_pages,
+            screen_status=screen_status,
+        )
+
+        # Wait after sending each page except the last one
+        if pn != total_pages:
+            await asyncio.sleep(duration)
+
+    # After all pages, send the last page again with DISPLAY_COMPLETE status
+    screen_status = AIStatus.DISPLAY_COMPLETE
+    await send_text_packet(
+        manager=manager,
+        text_message=text,
+        page_number=total_pages,
+        max_pages=total_pages,
+        screen_status=screen_status,
+    )
+
+    return text_message
+
+
+def group_words(words: List[str], config: RSVPConfig) -> List[str]:
+    """Group words according to configuration"""
+    groups = []
+    for i in range(0, len(words), config.words_per_group):
+        group = words[i : i + config.words_per_group]
+        if len(group) < config.words_per_group:
+            group.extend([config.padding_char] * (config.words_per_group - len(group)))
+        groups.append(" ".join(group))
+    return groups
+
+
+async def send_rsvp(manager, text: str, config: RSVPConfig):
+    """Display text using RSVP method with improved error handling"""
+    if not text:
+        logging.warning("Empty text provided")
+        return False
+
+    try:
+        # default delay is 01 second we are adding below to that so we need to calculate the delay
+        screen_delay = 60 / config.wpm
+        logging.info(f"Words screen change delay: {screen_delay}")
+        delay = min(screen_delay - 0.1, 0.1)  # Delay between words set min to 0.1
+        words = text.split()
+        if not words:
+            logging.warning("No words to display after splitting")
+            return False
+
+        # Add padding groups for initial display
+        padding_groups = [""] * (config.words_per_group - 1)
+        word_groups = padding_groups + group_words(words, config)
+
+        for group in word_groups:
+            if not group:  # Skip empty padding groups
+                await asyncio.sleep(delay * config.words_per_group)
+                continue
+
+            success = await send_text(manager, group)
+            if not success:
+                logging.error(f"Failed to display group: {group}")
+                return False
+
+            await asyncio.sleep(delay * config.words_per_group)
+
+        # Clear display
+        await send_text(manager, "--")
+        return True
+
+    except asyncio.CancelledError:
+        logging.info("RSVP display cancelled")
+        await send_text(manager, "--")  # Clear display on cancellation
+        raise
+    except Exception as e:
+        logging.error(f"Error in RSVP display: {e}")
+        await send_text(manager, "--")  # Try to clear display
+        return False
+
+
+async def send_notification(manager, notification: NCSNotification):
+    """Send a notification to the glasses."""
+    notification_chunks = await construct_notification(notification)
+    for chunk in notification_chunks:
+        await send_command_to_glasses(manager, chunk)
+        print(f"Sent chunk to glasses: {chunk}")
+        await asyncio.sleep(0.01)  # Small delay between chunks
+
+
+async def execute_command(manager, construct_func, *args, log_message: str = ""):
+    """Generic function to construct a command, send it to glasses, and log the action."""
+    command = construct_func(*args)
+    await send_command_to_glasses(manager, command)
+    if log_message:
+        logging.info(log_message)
+
+
+async def show_dashboard(manager, position: int):
+    """Show the dashboard at the specified position."""
+    await execute_command(
+        manager,
+        construct_dashboard_show_state,
+        DashboardState.ON,
+        position,
+        log_message=f"Dashboard shown at position {position}.",
+    )
+
+
+async def hide_dashboard(manager, position: int):
+    """Hide the dashboard."""
+    await execute_command(
+        manager,
+        construct_dashboard_show_state,
+        DashboardState.OFF,
+        position,
+        log_message="Dashboard hidden.",
+    )
+
+
+async def apply_silent_mode(manager, status: SilentModeStatus):
+    """Apply silent mode setting."""
+    await execute_command(
+        manager,
+        construct_silent_mode,
+        status,
+        log_message=f"Silent Mode set to {status.name}.",
+    )
+
+
+async def apply_brightness(manager, level: int, auto: BrightnessAuto):
+    """Apply brightness setting."""
+    await execute_command(
+        manager,
+        construct_brightness,
+        level,
+        auto,
+        log_message=f"Brightness set to {level} with Auto {auto.name}.",
+    )
+
+
+async def apply_headup_angle(manager, angle: int):
+    """Set head-up display angle."""
+    await execute_command(
+        manager,
+        construct_headup_angle,
+        angle,
+        log_message=f"Head-up display angle set to {angle} degrees.",
+    )
+
+
+async def add_or_update_note(manager, note_number: int, title: str, text: str):
+    """Add or update a note on the glasses."""
+    await execute_command(
+        manager,
+        construct_note_add,
+        note_number,
+        title,
+        text,
+        log_message=f"Note {note_number} added/updated.",
+    )
+
+
+async def delete_note(manager, note_number: int):
+    """Delete a note from the glasses."""
+    await execute_command(
+        manager,
+        construct_note_delete,
+        note_number,
+        log_message=f"Note {note_number} deleted.",
+    )
+
+
+async def send_command_to_glasses(manager, command):
+    """Helper function to send a command to the glasses."""
+    if manager.left_glass:
+        await manager.left_glass.send(command)
+        await asyncio.sleep(0.1)
+    if manager.right_glass:
+        await manager.right_glass.send(command)
+        await asyncio.sleep(0.1)
+
+
+async def apply_glasses_wear(manager, status: GlassesWearStatus):
+    """Enable or disable glasses wear detection."""
+    await execute_command(
+        manager,
+        construct_glasses_wear_command,
+        status,
+        log_message=f"Glasses wear detection set to {status.name}."
+    )
+
+async def send_image(manager, image_data: bytes):
+    """Send image data to the glasses using optimized functions."""
+    # Divide image data into packets using NumPy
+    packets_array = divide_image_data(image_data)
+
+    # Preconstruct all data packets using list comprehension
+    data_packets = [
+        construct_bmp_data_packet(seq, packet_array, seq == 0)
+        for seq, packet_array in enumerate(packets_array)
+    ]
+
+    # Concatenate image data for CRC
+    full_image_array = np.concatenate(packets_array)
+
+    # Send data to left glass first
+    if manager.left_glass:
+        await send_data_to_glass(manager.left_glass, data_packets, full_image_array)
+
+    # Send data to right glass after acknowledgment from left
+    if manager.right_glass:
+        await send_data_to_glass(manager.right_glass, data_packets, full_image_array)
+```
+
+`/Users/shawwalters/even-g1/setup.py`:
+
+```py
+# setup.py
+from setuptools import setup, find_packages
+
+setup(
+    name='even_glasses',
+    version='0.1.11',
+    author='Emin Genc',
+    author_email='emingench@gmail.com',
+    description='A Python package for managing even-realities glasses devices via BLE.',
+    long_description=open('README.md').read(),
+    long_description_content_type='text/markdown',
+    url='https://github.com/emingenc/even_glasses',
+    packages=find_packages(),
+    install_requires=[
+        'bleak>=0.22.3',  
+        'pydantic>=2.9.2',
+        'numpy>=1.26.4',
+        'numba>=0.60.0',
+    ],
+    classifiers=[
+        'Programming Language :: Python :: 3',
+        'License :: OSI Approved :: GNU General Public License v3 (GPLv3)',
+        'Operating System :: OS Independent',
+    ],
+    python_requires='>=3.9',
+)
+```
+
+`/Users/shawwalters/even-g1/examples.py`:
+
+```py
+import asyncio
+import argparse
+import logging
+from even_glasses.bluetooth_manager import GlassesManager
+from even_glasses.commands import send_text, send_rsvp, send_notification, send_image
+from even_glasses.models import RSVPConfig, NCSNotification
+from even_glasses.notification_handlers import handle_incoming_notification
+
+logging.basicConfig(level=logging.ERROR)
+logger = logging.getLogger(__name__)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Even Glasses Text Display Tests")
+
+    # Create mutually exclusive group for test type
+    test_type = parser.add_mutually_exclusive_group(required=True)
+    test_type.add_argument("--rsvp", action="store_true", help="Run RSVP test")
+    test_type.add_argument("--text", action="store_true", help="Run text test")
+    test_type.add_argument(
+        "--notification", action="store_true", help="Run notification test"
+    )
+    test_type.add_argument('--image', action='store_true', help='Send image')
+
+    # Optional arguments for RSVP configuration
+    parser.add_argument(
+        "--wpm", type=int, default=1200, help="Words per minute for RSVP (default: 750)"
+    )
+    parser.add_argument(
+        "--words-per-group",
+        type=int,
+        default=4,
+        help="Number of words per group for RSVP (default: 3)",
+    )
+    parser.add_argument(
+        "--input-file",
+        type=str,
+        default="./even_glasses/rsvp_story.txt",
+        help="Input text file path (default: ./even_glasses/rsvp_story.txt)",
+    )
+
+    args = parser.parse_args()
+    return args
+
+
+async def test_rsvp(manager: GlassesManager, text: str, config: RSVPConfig):
+    if not manager.left_glass or not manager.right_glass:
+        logger.error("Could not connect to glasses devices.")
+        return
+    await send_text(
+        manager, "Init message!"
+    )  # Initialize Even AI message sending
+    await asyncio.sleep(5)
+    await send_rsvp(manager, text, config)
+    await asyncio.sleep(3)
+    await send_text(manager, "RSVP Done! Restarting in 3 seconds")
+    await asyncio.sleep(3)
+
+
+async def test_text(manager: GlassesManager, text: str):
+    if not manager.left_glass or not manager.right_glass:
+        logger.error("Could not connect to glasses devices.")
+        return
+    await send_text(manager, text)
+
+
+async def test_notification(manager: GlassesManager, notification: NCSNotification):
+    if not manager.left_glass or not manager.right_glass:
+        logger.error("Could not connect to glasses devices.")
+        return
+    await send_notification(manager, notification)
+
+
+async def test_image(manager: GlassesManager, image_path: str):
+    if not manager.left_glass or not manager.right_glass:
+        logger.error("Could not connect to glasses devices.")
+        return
+    with open(image_path, 'rb') as f:
+        image_data = f.read()
+    await send_image(manager=manager, image_data=image_data)
+    logger.info("Image sent successfully.")
+
+
+async def main():
+    args = parse_args()
+
+    try:
+        with open(args.input_file, "r", encoding="utf-8") as f:
+            text = f.read()
+    except FileNotFoundError:
+        logger.error(f"Input file not found: {args.input_file}")
+        return
+
+    config = RSVPConfig(
+        words_per_group=args.words_per_group, wpm=args.wpm, padding_char="..."
+    )
+
+    manager = GlassesManager(left_address=None, right_address=None)
+    connected = await manager.scan_and_connect()
+
+    if connected:
+        # Assign notification handlers
+        if manager.left_glass:
+            manager.left_glass.notification_handler = handle_incoming_notification
+        if manager.right_glass:
+            manager.right_glass.notification_handler = handle_incoming_notification
+
+        counter = 1
+
+        try:
+            while True:
+                if args.image:
+                    await test_image(manager=manager, image_path='image_2.bmp')
+                elif args.rsvp:
+                    await test_rsvp(manager=manager, text=text, config=config)
+                elif args.text:
+                    message = f"Test message {counter}"
+                    await test_text(manager=manager, text=message)
+                elif args.notification:
+                    notification = NCSNotification(
+                        msg_id=1,
+                        title="Test Notification Title",
+                        subtitle="Test Notification Subtitle",
+                        message="This is a test notification",
+                        display_name="Test Notification",
+                        app_identifier="org.telegram.messenger",
+                    )
+                    await test_notification(manager=manager, notification=notification)
+                counter += 1
+                await asyncio.sleep(1)  # Prevent tight loop
+        except KeyboardInterrupt:
+            logger.info("Interrupted by user.")
+        finally:
+            await manager.disconnect_all()
+    else:
+        logger.error("Failed to connect to glasses.")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+`/Users/shawwalters/even-g1/main.py`:
+
+```py
+import asyncio
+import flet as ft
+from even_glasses.bluetooth_manager import GlassesManager
+from even_glasses.models import NCSNotification, RSVPConfig
+from even_glasses.notification_handlers import handle_incoming_notification
+import logging
+
+from even_glasses.models import (
+    SilentModeStatus,
+    BrightnessAuto,
+    GlassesWearStatus,
+)
+from even_glasses.commands import (
+    send_text,
+    send_rsvp,
+    send_notification,
+    apply_silent_mode,
+    apply_brightness,
+    apply_headup_angle,
+    add_or_update_note,
+    delete_note,
+    show_dashboard,
+    hide_dashboard,
+    apply_glasses_wear,
+)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Initialize GlassesManager
+manager = GlassesManager(left_address=None, right_address=None)
+
+DEBUG = False  # Toggle for debug features
+
+async def main(page: ft.Page):
+    page.title = "Glasses Control Panel"
+    page.horizontal_alignment = ft.CrossAxisAlignment.STRETCH
+    page.vertical_alignment = ft.MainAxisAlignment.START
+    page.padding = 20
+    page.scroll = ft.ScrollMode.AUTO
+
+    connected = False
+
+    # Event Log
+    log_output = ft.TextField(
+        value="",
+        read_only=True,
+        multiline=True,
+        expand=True,
+    )
+
+    def log_message(message):
+        log_output.value += message + "\n"
+        page.update()
+
+    # Status Components
+    def create_status_section():
+        status_header = ft.Text(
+            value="Glasses Status", size=20, weight=ft.FontWeight.BOLD
+        )
+
+        # Status indicators
+        left_status_icon = ft.Icon(
+            name=ft.icons.RADIO_BUTTON_UNCHECKED,
+            color=ft.colors.RED,
+            size=16,
+        )
+        right_status_icon = ft.Icon(
+            name=ft.icons.RADIO_BUTTON_UNCHECKED,
+            color=ft.colors.RED,
+            size=16,
+        )
+
+        # Status texts
+        left_status_text = ft.Text(value="Left Glass: Disconnected", size=14)
+        right_status_text = ft.Text(value="Right Glass: Disconnected", size=14)
+
+        # Combine icons and texts
+        left_status_row = ft.Row(
+            [left_status_icon, left_status_text],
+            spacing=5,
+            alignment=ft.MainAxisAlignment.START,
+        )
+        right_status_row = ft.Row(
+            [right_status_icon, right_status_text],
+            spacing=5,
+            alignment=ft.MainAxisAlignment.START,
+        )
+
+        # Combine both statuses
+        status_row = ft.Row(
+            [left_status_row, right_status_row],
+            spacing=20,
+            alignment=ft.MainAxisAlignment.START,
+        )
+
+        status_section = ft.Column(
+            [
+                status_header,
+                status_row,
+            ],
+            spacing=10,
+            expand=True,
+        )
+
+        return status_section, left_status_icon, right_status_icon, left_status_text, right_status_text
+
+    # Connection Buttons
+    def create_connection_buttons():
+        connect_button = ft.ElevatedButton(
+            text="Connect to Glasses",
+            tooltip="Search and connect to nearby glasses"
+        )
+        disconnect_button = ft.ElevatedButton(text="Disconnect Glasses", visible=False)
+        return ft.Row(
+            [connect_button, disconnect_button],
+            alignment=ft.MainAxisAlignment.CENTER,
+            spacing=20,
+            expand=True,
+        ), connect_button, disconnect_button
+
+    # Message Input Section
+    def create_message_section():
+        message_input = ft.TextField(label="Message to Send", expand=True)
+        send_button = ft.ElevatedButton(text="Send Message", disabled=True)
+        return ft.Column(
+            [
+                ft.Text(
+                    value="Send Text Message",
+                    size=18,
+                    weight=ft.FontWeight.BOLD,
+                ),
+                ft.Row(
+                    [message_input, send_button],
+                    spacing=10,
+                    expand=True,
+                ),
+            ],
+            spacing=10,
+            expand=True,
+        ), message_input, send_button
+
+    # Notification Input Section
+    def create_notification_section():
+        notification_header = ft.Text(
+            value="Send Custom Notification", size=18, weight=ft.FontWeight.BOLD
+        )
+        msg_id_input = ft.TextField(
+            label="Message ID",
+            width=200,
+            value="1",
+            keyboard_type=ft.KeyboardType.NUMBER,
+        )
+        app_identifier_field = ft.TextField(
+            label="App Identifier", width=400, value="org.telegram.messenger"
+        )
+        title_input = ft.TextField(label="Title", width=400, value="Message")
+        subtitle_input = ft.TextField(label="Subtitle", width=400, value="John Doe")
+        notification_message_input = ft.TextField(
+            label="Notification Message",
+            width=400,
+            multiline=True,
+            value="You have a new message from John Doe.",
+        )
+        display_name_input = ft.TextField(
+            label="Display Name", width=400, value="Telegram"
+        )
+        send_notification_button = ft.ElevatedButton(
+            text="Send Notification", disabled=True
+        )
+
+        inputs = ft.Column(
+            [
+                ft.Row(
+                    [msg_id_input, app_identifier_field],
+                    spacing=10,
+                    expand=True,
+                ),
+                ft.Row(
+                    [title_input, subtitle_input],
+                    spacing=10,
+                    expand=True,
+                ),
+                notification_message_input,
+                display_name_input,
+            ],
+            spacing=10,
+            expand=True,
+        )
+
+        return (
+            ft.Column(
+                [
+                    notification_header,
+                    inputs,
+                    ft.Row(
+                        [send_notification_button],
+                        alignment=ft.MainAxisAlignment.END,
+                    ),
+                ],
+                spacing=10,
+                expand=True,
+            ),
+            msg_id_input,
+            app_identifier_field,
+            title_input,
+            subtitle_input,
+            notification_message_input,
+            display_name_input,
+            send_notification_button,
+        )
+
+    # RSVP Configuration Section
+    def create_rsvp_section():
+        DEMO_RSVP_TEXT = """Welcome to the RSVP Demo!
+
+This is a demonstration of Rapid Serial Visual Presentation technology. RSVP allows you to read text quickly by showing words in rapid succession at a fixed point. This eliminates the need for eye movement during reading.
+
+Key Benefits of RSVP:
+1. Increased reading speed
+2. Better focus and concentration
+3. Reduced eye strain
+4. Improved comprehension
+5. Perfect for small displays
+
+How to use this demo:
+- Adjust the Words per group setting (1-4 words recommended)
+- Set your desired reading speed in Words Per Minute
+- Click Start RSVP to begin
+- The text will be displayed word by word or in small groups
+- You can pause anytime by disconnecting
+
+This demo contains various sentence lengths and punctuation to test the RSVP system's handling of different text patterns. For example, here's a longer sentence with multiple clauses, commas, and other punctuation marks to demonstrate how the system handles complex text structures in real-world scenarios.
+
+Tips for optimal reading:
+* Start with a slower speed (300-500 WPM)
+* Gradually increase the speed as you get comfortable
+* Use smaller word groups for higher speeds
+* Take breaks if you feel eye strain
+
+End of demo text. Thank you for trying out the RSVP feature!"""
+
+        rsvp_header = ft.Text(
+            value="RSVP Settings", size=18, weight=ft.FontWeight.BOLD
+        )
+        words_per_group = ft.TextField(
+            label="Words per Group",
+            width=200,
+            value="4",
+            keyboard_type=ft.KeyboardType.NUMBER,
+        )
+        wpm_input = ft.TextField(
+            label="Words per Minute",
+            width=200,
+            value="750",
+            keyboard_type=ft.KeyboardType.NUMBER,
+        )
+        padding_char = ft.TextField(
+            label="Padding Character",
+            width=200,
+            value="---",
+        )
+        rsvp_text = ft.TextField(
+            label="Text for RSVP",
+            multiline=True,
+            expand=True,
+            min_lines=3,
+            max_lines=10,
+            value=DEMO_RSVP_TEXT,
+        )
+        start_rsvp_button = ft.ElevatedButton(text="Start RSVP", disabled=True)
+        rsvp_status = ft.Text(value="RSVP Status: Ready", size=14)
+
+        config_inputs = ft.Row(
+            [words_per_group, wpm_input, padding_char],
+            alignment=ft.MainAxisAlignment.START,
+            spacing=20,
+        )
+
+        return (
+            ft.Column(
+                [
+                    rsvp_header,
+                    config_inputs,
+                    rsvp_text,
+                    ft.Row(
+                        [start_rsvp_button, rsvp_status],
+                        alignment=ft.MainAxisAlignment.START,
+                        spacing=20,
+                    ),
+                ],
+                spacing=10,
+            ),
+            words_per_group,
+            wpm_input,
+            padding_char,
+            rsvp_text,
+            start_rsvp_button,
+            rsvp_status,
+        )
+
+    # Command Section (Debug)
+    def create_command_section():
+        command_header = ft.Text(
+            value="Send Command (Debug)", size=18, weight=ft.FontWeight.BOLD
+        )
+        side_input = ft.TextField(
+            label="Side (l, r, or leave empty for both)",
+            width=200,
+        )
+        data_input = ft.TextField(
+            label="Data (space-separated hex values)",
+            width=400,
+        )
+        send_command_button = ft.ElevatedButton(
+            text="Send Command", disabled=True
+        )
+
+        inputs = ft.Row(
+            [side_input, data_input],
+            spacing=10,
+        )
+
+        return ft.Column(
+            [
+                command_header,
+                inputs,
+                ft.Row(
+                    [send_command_button],
+                    alignment=ft.MainAxisAlignment.START,
+                    spacing=20,
+                ),
+            ],
+            spacing=10,
+        ), side_input, data_input, send_command_button
+
+    # Create Settings Section
+    def create_settings_section():
+        settings_header = ft.Text(
+            value="Glasses Settings", size=18, weight=ft.FontWeight.BOLD
+        )
+
+        # Silent Mode Toggle
+        silent_mode_switch = ft.Switch(label="Silent Mode")
+        silent_mode_button = ft.ElevatedButton(text="Apply Silent Mode")
+
+        # Brightness Control
+        brightness_slider = ft.Slider(
+            label="Brightness Level",
+            min=0,
+            max=41,
+            divisions=41,
+            value=20,
+            tooltip="Adjust brightness level (0-41)"
+        )
+        brightness_auto_switch = ft.Switch(label="Auto Brightness")
+        brightness_button = ft.ElevatedButton(text="Apply Brightness")
+
+        # Dashboard Position Selector
+        dashboard_position_dropdown = ft.Dropdown(
+            label="Dashboard Position",
+            options=[
+                ft.dropdown.Option(key=str(i), text=f"Position {i}") for i in range(9)
+            ],
+            value="0",
+        )
+        show_dashboard_button = ft.ElevatedButton(
+            text="Show Dashboard",
+        )
+        hide_dashboard_button = ft.ElevatedButton(
+            text="Hide Dashboard",
+        )
+
+        # Head-up Angle Control
+        headup_angle_slider = ft.Slider(
+            label="Head-up Display Angle",
+            min=0,
+            max=60,
+            divisions=60,
+            value=30,
+            tooltip="Adjust head-up display angle (0-60 degrees)"
+        )
+        headup_angle_button = ft.ElevatedButton(text="Apply Head-up Angle")
+
+        # Note Management
+        note_number_dropdown = ft.Dropdown(
+            label="Note Number",
+            options=[
+                ft.dropdown.Option(key=str(i), text=f"Note {i}") for i in range(1, 5)
+            ],
+            value="1",
+        )
+        note_title_input = ft.TextField(
+            label="Note Title",
+            multiline=False,
+            expand=True,
+        )
+            
+        note_text_input = ft.TextField(
+            label="Note Text",
+            multiline=False,
+            expand=True,
+        )
+        note_add_button = ft.ElevatedButton(text="Add/Update Note")
+        note_delete_button = ft.ElevatedButton(text="Delete Note")
+
+        # Glasses Wear Detection Controls
+        glasses_wear_switch = ft.Switch(label="Enable Glasses Wear Detection")
+        glasses_wear_button = ft.ElevatedButton(text="Apply Glasses Wear Setting")
+
+        # Assemble Settings Sections
+        settings_section = ft.Column(
+            [
+                settings_header,
+                ft.Divider(),
+                ft.Text("Silent Mode", size=16, weight=ft.FontWeight.BOLD),
+                silent_mode_switch,
+                silent_mode_button,
+                ft.Divider(),
+                ft.Text("Brightness Control", size=16, weight=ft.FontWeight.BOLD),
+                brightness_slider,
+                brightness_auto_switch,
+                brightness_button,
+                ft.Divider(),
+                ft.Text("Dashboard Control", size=16, weight=ft.FontWeight.BOLD),
+                dashboard_position_dropdown,
+                ft.Row(
+                    [show_dashboard_button, hide_dashboard_button],
+                    alignment=ft.MainAxisAlignment.START,
+                    spacing=10,
+                ),
+                ft.Divider(),
+                ft.Text("Head-up Display Angle", size=16, weight=ft.FontWeight.BOLD),
+                headup_angle_slider,
+                headup_angle_button,
+                ft.Divider(),
+                ft.Text("Note Management", size=16, weight=ft.FontWeight.BOLD),
+                ft.Row([note_number_dropdown, note_title_input, note_text_input], spacing=10),
+                ft.Row([note_add_button, note_delete_button], spacing=10),
+                ft.Divider(),
+                ft.Text("Glasses Wear Detection", size=16, weight=ft.FontWeight.BOLD),
+                glasses_wear_switch,
+                glasses_wear_button,
+            ],
+            spacing=10,
+            expand=True,
+        )
+
+        return (
+            settings_section,
+            silent_mode_switch,
+            silent_mode_button,
+            brightness_slider,
+            brightness_auto_switch,
+            brightness_button,
+            dashboard_position_dropdown,
+            show_dashboard_button,
+            hide_dashboard_button,
+            headup_angle_slider,
+            headup_angle_button,
+            note_number_dropdown,
+            note_title_input,
+            note_text_input,
+            note_add_button,
+            note_delete_button,
+            glasses_wear_switch,    # Include the new switch
+            glasses_wear_button,    # Include the new button
+        )
+
+    # Create Components
+    status_section, left_status_icon, right_status_icon, left_status_text, right_status_text = create_status_section()
+    connection_buttons, connect_button, disconnect_button = create_connection_buttons()
+    connection_buttons = ft.Row(
+        [connect_button, disconnect_button],
+        alignment=ft.MainAxisAlignment.CENTER,
+        spacing=20,
+        expand=True,
+    )
+    message_section, message_input, send_button = create_message_section()
+    (
+        notification_section,
+        msg_id_input,
+        app_identifier_field,
+        title_input,
+        subtitle_input,
+        notification_message_input,
+        display_name_input,
+        send_notification_button,
+    ) = create_notification_section()
+    (
+        rsvp_section,
+        words_per_group,
+        wpm_input,
+        padding_char,
+        rsvp_text,
+        start_rsvp_button,
+        rsvp_status,
+    ) = create_rsvp_section()
+
+    if DEBUG:
+        command_section, side_input, data_input, send_command_button = create_command_section()
+
+    (
+        settings_section,
+        silent_mode_switch,
+        silent_mode_button,
+        brightness_slider,
+        brightness_auto_switch,
+        brightness_button,
+        dashboard_position_dropdown,
+        show_dashboard_button,
+        hide_dashboard_button,
+        headup_angle_slider,
+        headup_angle_button,
+        note_number_dropdown,
+        note_title_input,
+        note_text_input,
+        note_add_button,
+        note_delete_button,
+        glasses_wear_switch,    # Include the new switch
+        glasses_wear_button,    # Include the new button
+    ) = create_settings_section()
+
+    # Update Status Function
+    def on_status_changed():
+        nonlocal connected
+        left_glass = manager.left_glass
+        right_glass = manager.right_glass
+
+        previous_connected = connected
+
+        # Update left glass status
+        if left_glass and left_glass.client.is_connected:
+            left_status_icon.name = ft.icons.RADIO_BUTTON_CHECKED
+            left_status_icon.color = ft.colors.GREEN
+            left_status_text.value = f"Left Glass ({left_glass.name[:13]}): Connected"
+        else:
+            left_status_icon.name = ft.icons.RADIO_BUTTON_UNCHECKED
+            left_status_icon.color = ft.colors.RED
+            left_status_text.value = "Left Glass: Disconnected"
+
+        # Update right glass status
+        if right_glass and right_glass.client.is_connected:
+            right_status_icon.name = ft.icons.RADIO_BUTTON_CHECKED
+            right_status_icon.color = ft.colors.GREEN
+            right_status_text.value = f"Right Glass ({right_glass.name[:13]}): Connected"
+        else:
+            right_status_icon.name = ft.icons.RADIO_BUTTON_UNCHECKED
+            right_status_icon.color = ft.colors.RED
+            right_status_text.value = "Right Glass: Disconnected"
+
+        # Determine overall connection status
+        connected = (left_glass and left_glass.client.is_connected) or (
+            right_glass and right_glass.client.is_connected
+        )
+
+        if connected != previous_connected:
+            if connected:
+                log_message("Glasses connected.")
+            else:
+                log_message("Glasses disconnected.")
+
+        connect_button.visible = not connected
+        disconnect_button.visible = connected
+        send_button.disabled = not connected
+        send_notification_button.disabled = not connected
+        start_rsvp_button.disabled = not connected
+        if DEBUG:
+            send_command_button.disabled = not connected
+        silent_mode_button.disabled = not connected
+        brightness_button.disabled = not connected
+        show_dashboard_button.disabled = not connected
+        hide_dashboard_button.disabled = not connected
+        headup_angle_button.disabled = not connected
+        note_add_button.disabled = not connected
+        note_delete_button.disabled = not connected
+        glasses_wear_button.disabled = not connected
+        page.update()
+
+    # Async Event Handlers
+    async def connect_glasses(e):
+        progress = ft.ProgressRing()
+        connect_button.content = ft.Row([progress, ft.Text("Connecting...")])
+        connect_button.disabled = True
+        page.update()
+        connected = await manager.scan_and_connect()
+
+        if connected:
+            # Assign notification handlers
+            if manager.left_glass:
+                manager.left_glass.notification_handler = handle_incoming_notification
+            if manager.right_glass:
+                manager.right_glass.notification_handler = handle_incoming_notification
+
+        on_status_changed()
+        connect_button.disabled = False
+        page.update()
+
+    async def disconnect_glasses(e):
+        disconnect_button.disabled = True
+        page.update()
+        await manager.disconnect_all()
+        log_message("Disconnected all glasses.")
+        on_status_changed()
+        disconnect_button.disabled = False
+        page.update()
+
+    async def send_message(e):
+        try:
+            message = message_input.value.strip()
+            if not message:
+                log_message("Please enter a message to send.")
+                return
+            await send_text(manager, message)
+            log_message(f"Message sent: {message}")
+        except Exception as ex:
+            log_message(f"Error sending message: {ex}")
+
+    async def send_custom_notification(e):
+        try:
+            notification = NCSNotification(
+                msg_id=int(msg_id_input.value),
+                app_identifier=app_identifier_field.value,
+                title=title_input.value,
+                subtitle=subtitle_input.value,
+                message=notification_message_input.value,
+                display_name=display_name_input.value,
+            )
+            await send_notification(manager, notification)
+            log_message("Notification sent.")
+        except ValueError as ex:
+            log_message(f"Error creating notification: {ex}")
+
+    async def start_rsvp(e):
+        try:
+            config = RSVPConfig(
+                words_per_group=int(words_per_group.value),
+                wpm=int(wpm_input.value),
+                padding_char=padding_char.value,
+            )
+            text = rsvp_text.value.strip()
+            if not text:
+                log_message("Please enter text for RSVP.")
+                return
+            rsvp_status.value = "RSVP Status: Running"
+            page.update()
+            await send_rsvp(manager, text, config)
+            rsvp_status.value = "RSVP Status: Completed"
+            log_message("RSVP completed.")
+        except ValueError as ex:
+            log_message(f"Error starting RSVP: {ex}")
+        except Exception as ex:
+            log_message(f"Error during RSVP: {ex}")
+        finally:
+            rsvp_status.value = "RSVP Status: Ready"
+            page.update()
+
+    async def send_command_to_device(e):
+        device = side_input.value.strip()
+        data_str = data_input.value.strip()
+
+        # Process data input
+        data_bytes = bytearray()
+        if data_str:
+            data_items = data_str.split()
+            for item in data_items:
+                try:
+                    data_int = int(item, 16)
+                    data_bytes.append(data_int)
+                except ValueError:
+                    log_message(f"Invalid data value '{item}'. Please enter hex values.")
+                    return
+
+        # Determine targets
+        if device == '':
+            # Send to both devices
+            if manager.left_glass:
+                await manager.left_glass.send(data_bytes)
+            if manager.right_glass:
+                await manager.right_glass.send(data_bytes)
+        elif device == 'l':
+            if manager.left_glass:
+                await manager.left_glass.send(data_bytes)
+        elif device == 'r':
+            if manager.right_glass:
+                await manager.right_glass.send(data_bytes)
+        else:
+            log_message("Invalid device identifier. Use 'l' for left, 'r' for right, or leave empty for both.")
+            return
+
+        log_message(f"Sent command to device '{device}': {data_bytes.hex()}")
+        page.update()
+
+    async def apply_silent_mode_handler(e):
+        status = SilentModeStatus.ON if silent_mode_switch.value else SilentModeStatus.OFF
+        await apply_silent_mode(manager, status)
+        log_message(f"Silent Mode set to {status.name}.")
+
+    async def apply_brightness_handler(e):
+        level = int(brightness_slider.value)
+        auto = BrightnessAuto.ON if brightness_auto_switch.value else BrightnessAuto.OFF
+        await apply_brightness(manager, level, auto)
+        log_message(f"Brightness set to {level} with Auto {auto.name}.")
+
+    async def show_dashboard_handler(e):
+        try:
+            position = int(dashboard_position_dropdown.value)
+            await show_dashboard(manager, position)
+            log_message(f"Dashboard shown at position {position}.")
+        except ValueError:
+            log_message("Invalid dashboard position selected.")
+
+    async def hide_dashboard_handler(e):
+        position = int(dashboard_position_dropdown.value)
+        await hide_dashboard(manager, position)
+        log_message("Dashboard hidden.")
+
+    async def apply_headup_angle_handler(e):
+        angle = int(headup_angle_slider.value)
+        await apply_headup_angle(manager, angle)
+        log_message(f"Head-up display angle set to {angle} degrees.")
+
+    async def add_or_update_note_handler(e):
+        note_number = int(note_number_dropdown.value)
+        note_title_value = note_title_input.value.strip()
+        note_text_value = note_text_input.value.strip()
+        if not note_text_value or not note_title_value:
+            log_message("Please enter note text.")
+            return
+        await add_or_update_note(manager, note_number, note_title_value, note_text_value)
+        log_message(f"Note {note_number} added/updated.")
+
+    async def delete_note_handler(e):
+        note_number = int(note_number_dropdown.value)
+        await delete_note(manager, note_number)
+        log_message(f"Note {note_number} deleted.")
+
+    async def apply_glasses_wear_handler(e):
+        status = GlassesWearStatus.ON if glasses_wear_switch.value else GlassesWearStatus.OFF
+        await apply_glasses_wear(manager, status)
+        log_message(f"Glasses Wear Detection set to {status.name}.")
+
+    def on_keyboard(e: ft.KeyboardEvent):
+        if e.key == "Enter" and e.ctrl:
+            send_message(None)
+    page.on_keyboard_event = on_keyboard
+
+    # Assign Event Handlers
+    connect_button.on_click = connect_glasses
+    disconnect_button.on_click = disconnect_glasses
+    send_button.on_click = send_message
+    send_notification_button.on_click = send_custom_notification
+    start_rsvp_button.on_click = start_rsvp
+    if DEBUG:
+        send_command_button.on_click = send_command_to_device
+    silent_mode_button.on_click = apply_silent_mode_handler
+    brightness_button.on_click = apply_brightness_handler
+    headup_angle_button.on_click = apply_headup_angle_handler
+    note_add_button.on_click = add_or_update_note_handler
+    note_delete_button.on_click = delete_note_handler
+    hide_dashboard_button.on_click = hide_dashboard_handler
+    show_dashboard_button.on_click = show_dashboard_handler
+    glasses_wear_button.on_click = apply_glasses_wear_handler
+
+    # Organize UI into Tabs
+    tabs = ft.Tabs(
+        selected_index=0,
+        tabs=[
+            ft.Tab(
+                text="Messages",
+                content=message_section,
+                icon=ft.icons.MESSAGE,
+            ),
+            ft.Tab(
+                text="Notifications",
+                content=notification_section,
+                icon=ft.icons.NOTIFICATIONS,
+            ),
+            ft.Tab(
+                text="RSVP",
+                content=rsvp_section,
+                icon=ft.icons.VIEW_AGENDA,
+            ),
+            ft.Tab(
+                text="Logs",
+                content=ft.Column(
+                    [
+                        ft.Text(
+                            value="Event Log:",
+                            size=16,
+                            weight=ft.FontWeight.BOLD,
+                        ),
+                        log_output,
+                    ]
+                ),
+                icon=ft.icons.LIST,
+            ),
+        ],
+        expand=True,
+        adaptive=True,
+    )
+
+    if DEBUG:
+        tabs.tabs.insert(
+            3,
+            ft.Tab(
+                text="Debug",
+                content=command_section,
+                icon=ft.icons.BUG_REPORT,
+            )
+        )
+
+    # Add settings tab to the application
+    tabs.tabs.append(
+        ft.Tab(
+            text="Settings",
+            content=settings_section,
+            icon=ft.icons.SETTINGS,
+        )
+    )
+
+    # Main Layout
+    main_content = ft.Column(
+        [
+            # Top status bar
+            ft.Container(
+                content=ft.Card(
+                    content=ft.Container(
+                        content=ft.Column(
+                            [
+                                ft.ResponsiveRow(
+                                    [
+                                        ft.Container(
+                                            content=status_section,
+                                            padding=10,
+                                            col={"xs": 12, "sm": 12, "md": 12, "lg": 12, "xl": 12},
+                                        ),
+                                    ],
+                                ),
+                                ft.ResponsiveRow(
+                                    [
+                                        ft.Container(
+                                            content=connection_buttons,
+                                            padding=10,
+                                            col={"xs": 12, "sm": 12, "md": 12, "lg": 12, "xl": 12},
+                                        ),
+                                    ],
+                                ),
+                            ],
+                            spacing=10,
+                        ),
+                        padding=10,
+                    ),
+                ),
+            ),
+            
+            # Main content area with tabs
+            ft.Container(
+                content=ft.Column(
+                    [
+                        tabs,
+                    ],
+                    expand=True,
+                    
+                ),
+                padding=10,
+                expand=True,
+            ),
+        ],
+        spacing=20,
+        expand=True,
+    )
+
+    # Update page settings
+    page.padding = ft.padding.all(20)
+    page.bgcolor = ft.colors.BACKGROUND
+
+    # Wrap main content in a centered container
+    page.add(
+        ft.Container(
+            content=main_content,
+            expand=True,
+            margin=ft.margin.only(left=20, right=20),
+        )
+    )
+
+    # Background task to monitor status
+    async def status_monitor():
+        while True:
+            await asyncio.sleep(1)  # Check every 1 second
+            on_status_changed()
+
+    asyncio.create_task(status_monitor())
+
+ft.app(target=main)
+```
+
+
+# Even Demo
+
+## Even AI
+The general process of the Even AI function is as follows: After the app and glasses are 
+connected via dual Bluetooth, long press the left-side TouchBar on the glasses to enter the 
+Even AI activation state. At this point, the app will receive the [0xF5, 0x17] command from the 
+glasses. The app then needs to send a command [0x0E, 0x01] to the glasses to activate the 
+right-side microphone for recording. Once the microphone is successfully activated, the app 
+will receive a real-time audio stream in LC3 format. Keep pressing until speaking is finished, 
+the maximum supported recording duration is 30 seconds. After the recording is finished, the 
+app needs to convert the audio stream into text, which is then sent to the large model for a 
+response. After the app successfully obtains the response from the large model, it can send 
+the result to the glasses according to the Bluetooth protocol. By default, the result is 
+transmitted automatically, page by page. During transmission, a single tap on the TouchBar 
+will switch to manual mode, with the left-side TouchBar used for page-up and the right-side 
+TouchBar for page-down. A double-tap on the TouchBar will directly exit the Even AI function.
+
+
+## Image Sending
+Image transmission currently supports 1-bit, 576*136 pixel BMP images (refer to image_1.bmp, image_2.bmp in the project). 
+The core process includes three steps: 
+- 1. Divide the BMP image data into packets (each packet is 194 bytes), then add 0x15 command and syncID to the front of the packet, and send it to the dual BLE in the order of the packets (the left and right sides can be sent independently at the same time). The first packet needs to insert 4 bytes of glasses end storage address 0x00, 0x1c, 0x00, 0x00, so the first packet data is ([0x15, index & 0xff, 0x00, 0x1c, 0x00, 0x00], pack), and other packets do not need addresses 0x00, 0x1c, 0x00, 0x00;
+- 2. After sending the last packet, it is necessary to send the packet end command [0x20, 0x0d, 0x0e] to the dual BLE;
+- 3. After the packet end command in step 2 is correctly replied, send the CRC check command to the dual BLE through the 0x16 command. When calculating the CRC, it is necessary to consider the glasses end storage address added when sending the first BMP packet.
+     
+For a specific example, click the icon in the upper right corner of the App homepage to enter the Features page. The page contains three buttons: BMP 1, BMP 2, and Exit, which represent the transmission and display of picture 1, the transmission and display of picture 2, and the exit of picture transmission and display.
+
+
+## Text Sending
+Currently, the demo supports sending text directly to the glasses and displaying it.
+The core steps are as follows:
+- 1. Divide the input text into lines according to the actual display width of the glasses (the value in the demo is 488, which can be fine-tuned) and the font size you want (the value in the demo is 21, which can be customized);
+- 2. Combine the number of lines per screen (the value in the demo is 5) and the size limit of each ble packet to divide the text divided in step 1 into packets (5 lines are displayed per screen in the demo, the first three lines form one packet, and the last two lines form one packet);
+- 3. Use the Text Sending protocol in the protocol section below to send the multi-packet data in step 2 to the glasses by screen (a timer is used in the demo to send each screen of text in sequence).
+
+
+
+## Instructions
+G1’s dual Bluetooth communication is unique, each arm corresponds to a separate BLE 
+connection. During communication, unless the protocol specifies sending data to only one 
+side (e.g., microphone activation to the right), the app should: 
+- First send data to the left side. 
+- Then send data to the right side after receiving a successful acknowledgment from the left. 
+ Also, consider the glasses' display width limitation: during the Even AI function, the 
+maximum width is 488 pixels, with eac
+
+
+
+
+
+## Protocol
+### TouchBar Events
+#### Single Tap
+ - 0xf5 0x01
+ - When checking the dashboard, you can flip to the next QuickNote by tapping the right TouchBar. Or you can read the detail of your unread notifications by tapping the left TouchBar.
+ - In the teleprompting or evenai features, forward/back the page by tapping the right/left TouchBar.
+
+#### Double Tap
+ - 0xf5 0x00
+ - Close the features or turn off display details.
+
+#### Triple Tap
+ - 0xf5 0x04/0x05
+ - Toggle Silent Mode.
+
+
+### Start Even AI 
+#### Command Information 
+ - Command: 0xF5
+   - subcmd (Sub-command): 0~255
+   - param (Parameters): Specific parameters associated with each sub-command.
+#### Sub-command Descriptions 
+ - subcmd: 0 (exit to dashboard manually).
+   - Description: Stop all advanced features and return to the dashboard. 
+ - subcmd: 1 (page up/down control in manual mode). 
+   - Description: page-up(left ble) / page-down (right ble) 
+- subcmd: 23 （start Even AI).
+   - Description: Notify phone to activate Even AI. 
+- subcmd: 24 （stop Even AI recording).
+   - Description: Even AI recording ended.
+
+### Open Glasses Mic 
+#### Command Information 
+ - Command: 0x0E
+ - enable:
+   - 0 (Disable) / 1 (Enable)
+#### Description 
+ - enable: 
+   - 0: Disable the MIC (turn off sound pickup). 
+   - 1: Enable the MIC (turn on sound pickup). 
+#### Response from Glasses 
+ - Command: 0x0E
+ - rsp_status (Response Status): 
+   - 0xC9: Success
+   - 0xCA: Failure
+ - enable: 
+   - 0: MIC disabled.
+   - 1: MIC enabled.
+#### Example 
+ - Command sent to device: 0x0E, with enable = 1 to enable the MIC. 
+ - Device response: 
+   - If successful: 0x0E with rsp_status = 0xC9 and enable = 1. 
+   - If failed: 0x0E with rsp_status = 0xCA and enable = 1.
+   
+### Receive Glasses Mic data 
+#### Command Information 
+ - Command: 0xF1
+ - seq (Sequence Number): 0~255
+ - data (Audio Data): Actual MIC audio data being transmitted. 
+#### Field Descriptions 
+- seq (Sequence Number): 
+   - Range: 0~255
+   - Description: This is the sequence number of the current data packet. It helps to ensure 
+the order of the audio data being received. 
+- data (Audio Data): 
+   - Description: The actual audio data captured by the MIC, transmitted in chunks according 
+to the sequence. 
+#### Example 
+- Command: 0xF1, with seq = 10 and data = [Audio Data] 
+- Description: This command transmits a chunk of audio data from the glasses' MIC, with a 
+sequence number of `10` to maintain packet order. 
+
+### Send AI Result 
+#### Command Information 
+ - Command: 0x4E
+ - seq (Sequence Number): 0~255
+ - total_package_num (Total Package Count): 1~255
+ - current_package_num (Current Package Number): 0~255
+ - newscreen (Screen Status) 
+#### Field Descriptions 
+ - seq (Sequence Number): 
+   - Range: 0~255
+   - Description: Indicates the sequence of the current package. 
+ - total_package_num (Total Package Count): 
+   - Range: 1~255
+   - Description: The total number of packages being sent in this transmission. 
+ - current_package_num (Current Package Number): 
+   - Range: 0~255 
+   - Description: The current package number within the total, starting from 0. 
+ - newscreen (Screen Status): 
+   - Composed of lower 4 bits and upper 4 bits to represent screen status and Even AI 
+mode. 
+   ##### Lower 4 Bits (Screen Action): 
+      - 0x01: Display new content
+ 
+   ##### Upper 4 Bits (Even AI Status): 
+      - 0x30: Even AI displaying（automatic mode default）
+      - 0x40: Even AI display complete (Used when the last page of automatic mode) 
+      - 0x50: Even AI manual mode 
+      - 0x60: Even AI network error
+   
+   ##### Example:
+   - New content + Even AI displaying state is represented as 0x31.
+- new_char_pos0 and new_char_pos1: 
+   - new_char_pos0: Higher 8 bits of the new character position. 
+   - new_char_pos1: Lower 8 bits of the new character position. 
+- current_page_num (Current Page Number): 
+   - Range: 0~255
+   - Description: Represents the current page number. 
+- max_page_num (Maximum Page Number): 
+   - Range: 1~255 
+   - Description: The total number of pages. 
+- data (Data): 
+   - Description: The actual data being transmitted in this package.
+
+### Send bmp data packet 
+#### Command Information 
+ - Command: 0x15
+ - seq (Sequence Number): 0~255
+ - address: [0x00, 0x1c, 0x00, 0x00]
+ - data0 ~ data194 
+#### Field Descriptions 
+ - seq (Sequence Number): 
+   - Range: 0~255
+   - Description: Indicates the sequence of the current package.
+ - address:
+   bmp address in the Glasses (just attached in the first pack)
+ - data0 ~ data194:
+   - bmp data packet
+
+### Bmp data packet transmission ends 
+#### Command Information 
+ - Command: 0x20
+ - data0: 0x0d
+ - data1: 0x0e
+#### Field Descriptions 
+ - Fixed format command： [0x20, 0x0d, 0x0e]
+
+### CRC Check 
+#### Command Information 
+ - Command: 0x16
+ - crc 
+#### Field Descriptions 
+ - crc:
+   The crc check value calculated using Crc32Xz big endian, combined with the bmp picture storage address and picture data.
+
+
+### Text Sending 
+#### Command Information 
+ - Command: 0x4E
+ - seq (Sequence Number): 0~255
+ - total_package_num (Total Package Count): 1~255
+ - current_package_num (Current Package Number): 0~255
+ - newscreen (Screen Status) 
+#### Field Descriptions 
+ - seq (Sequence Number): 
+   - Range: 0~255
+   - Description: Indicates the sequence of the current package. 
+ - total_package_num (Total Package Count): 
+   - Range: 1~255
+   - Description: The total number of packages being sent in this transmission. 
+ - current_package_num (Current Package Number): 
+   - Range: 0~255 
+   - Description: The current package number within the total, starting from 0. 
+ - newscreen (Screen Status): 
+   - Composed of lower 4 bits and upper 4 bits to represent screen status and Even AI 
+mode. 
+   ##### Lower 4 Bits (Screen Action): 
+      - 0x01: Display new content
+ 
+   ##### Upper 4 Bits (Status): 
+      - 0x70: Text Show
+   
+   ##### Example:
+   - New content + Text Show state is represented as 0x71.
+- new_char_pos0 and new_char_pos1: 
+   - new_char_pos0: Higher 8 bits of the new character position. 
+   - new_char_pos1: Lower 8 bits of the new character position. 
+- current_page_num (Current Page Number): 
+   - Range: 0~255
+   - Description: Represents the current page number. 
+- max_page_num (Maximum Page Number): 
+   - Range: 1~255 
+   - Description: The total number of pages. 
+- data (Data): 
+   - Description: The actual data being transmitted in this package.
+
+
+
+
+
+
+
